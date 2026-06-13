@@ -130,26 +130,35 @@ curl http://<NODE1_IP>:8888/v1/chat/completions \
 
 Expected: coherent response ("2+2 is 4" or similar), ~18 tok/s decode.
 
-### With thinking enabled (default):
+### Longer output (with repetition mitigation):
 
-Omit `chat_template_kwargs` — thinking is on by default:
+For outputs beyond ~50 tokens, add a repetition penalty to avoid looping:
 
 ```bash
 curl http://<NODE1_IP>:8888/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "step3p7",
-    "messages": [{"role": "user", "content": "What is 2+2?"}],
+    "messages": [{"role": "user", "content": "Explain neural networks in 3 sentences."}],
     "max_tokens": 200,
-    "temperature": 0
+    "temperature": 0,
+    "repetition_penalty": 1.1,
+    "chat_template_kwargs": {"enable_thinking": false}
   }'
 ```
 
+Expected: a coherent paragraph. Without `repetition_penalty`, output may degrade
+into repetition past ~100 tokens. See Known issues below.
+
 ## Known issues
 
-- **Long generation (>100 tokens) can loop.** Use `repetition_penalty: 1.1` or similar
-  for longer outputs. This reproduces on pre-patch Atlas as well — not specific to this
-  branch.
+- **⚠️ Long generation (>100 tokens) degrades into repetition.** This is the most
+  significant open issue. Output is coherent for short responses but loops past ~100
+  tokens without `repetition_penalty`. Using `"repetition_penalty": 1.1` mitigates it
+  but we have not validated long-form quality even with it. This reproduces on pre-patch
+  Atlas as well, suggesting it may not be caused by our changes — but we have not
+  root-caused it. **If your use case requires reliable output beyond ~100 tokens, this
+  branch does not yet deliver that.**
 - **Memory is tight.** `--max-seq-len 512` works reliably; higher values may cause OOM
   and system unresponsiveness. If the Spark becomes unresponsive, power-cycle and use
   more conservative settings.
