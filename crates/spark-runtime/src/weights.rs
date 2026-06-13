@@ -225,6 +225,120 @@ pub(crate) fn parse_expert_index(name: &str) -> Option<usize> {
     None
 }
 
+/// True for *fused* MoE expert-projection tensors whose leading axis is the
+/// expert dimension: `*.moe.{gate,up,down}_proj.{weight,weight_scale,input_scale}`.
+///
+/// These pack every expert's projection into one contiguous tensor (Step 3.7
+/// format). Under EP each rank only needs its local experts' rows, which form
+/// a contiguous byte range we can slice out at load time.
+///
+/// Deliberately excludes:
+///   * `*.moe.{...}_proj.weight_scale_2` — a per-tensor scalar, not per-expert.
+///   * `*.moe.gate.weight` / `*.moe.router_bias` — the router, replicated.
+///   * `*.moe.experts.{N}.*` — per-expert tensors (handled by the EP skip filter).
+///   * `*.share_expert.*` — the shared expert (no `.moe.` segment), replicated.
+pub(crate) fn is_fused_moe_proj(name: &str) -> bool {
+    const PROJS: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
+    const SUFFIXES: [&str; 3] = ["weight", "weight_scale", "input_scale"];
+    for suffix in SUFFIXES {
+        // strip_suffix is exact-tail: ".weight" never matches ".weight_scale"
+        // or ".weight_scale_2", so weight_scale_2 is correctly excluded.
+        let Some(rest) = name.strip_suffix(suffix).and_then(|r| r.strip_suffix('.')) else {
+            continue;
+        };
+        for proj in PROJS {
+            if let Some(head) = rest.strip_suffix(proj) {
+                if head.ends_with(".moe.") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Expert-parallel sharding parameters for fused MoE tensors.
+///
+/// Mirrors [`atlas_core::config::ModelConfig::local_expert_range`] so the
+/// weight loader and the model agree on which experts a rank owns. For fused
+/// MoE projection tensors (see [`is_fused_moe_proj`]) the loader reads only the
+/// local experts' rows; every other tensor is loaded whole (replicated).
+#[derive(Clone, Copy)]
+pub(crate) struct EpShard {
+    pub ep_rank: usize,
+    pub ep_world_size: usize,
+    pub num_experts: usize,
+}
+
+impl EpShard {
+    /// EP disabled — nothing is sharded.
+    pub fn inactive() -> Self {
+        Self {
+            ep_rank: 0,
+            ep_world_size: 1,
+            num_experts: 0,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.ep_world_size > 1 && self.num_experts > 0
+    }
+
+    /// Local `[start, end)` expert range for this rank (last rank gets the
+    /// remainder). Identical to `ModelConfig::local_expert_range`.
+    fn local_range(&self) -> (usize, usize) {
+        let per_rank = self.num_experts / self.ep_world_size;
+        let start = self.ep_rank * per_rank;
+        let end = if self.ep_rank == self.ep_world_size - 1 {
+            self.num_experts
+        } else {
+            start + per_rank
+        };
+        (start, end)
+    }
+
+    /// If `name` is a fused MoE expert-projection tensor, return
+    /// `(sub_offset_bytes, sub_len_bytes, local_shape)` for this rank's row
+    /// slice. Returns `None` when EP is off, the tensor isn't a fused expert
+    /// projection, or the leading axis doesn't tile evenly by the expert count
+    /// (in which case the caller loads the whole tensor).
+    pub fn fused_slice(
+        &self,
+        name: &str,
+        shape: &[usize],
+        full_len: usize,
+    ) -> Option<(usize, usize, Vec<usize>)> {
+        if !self.active() || !is_fused_moe_proj(name) {
+            return None;
+        }
+        let rows = *shape.first()?;
+        // Expert dim must tile the leading axis evenly, and rows must tile the
+        // byte length evenly (contiguous, no ragged trailing fragment).
+        if rows == 0 || rows % self.num_experts != 0 || full_len % rows != 0 {
+            return None;
+        }
+        let (start, end) = self.local_range();
+        let rows_per_expert = rows / self.num_experts;
+        let bytes_per_row = full_len / rows;
+        let local_row_start = start * rows_per_expert;
+        let local_rows = (end - start) * rows_per_expert;
+        let sub_offset = local_row_start * bytes_per_row;
+        let sub_len = local_rows * bytes_per_row;
+        let mut local_shape = shape.to_vec();
+        local_shape[0] = local_rows;
+        Some((sub_offset, sub_len, local_shape))
+    }
+
+    /// Bytes this rank actually loads for a tensor: the sliced size for fused
+    /// MoE projections, otherwise the full size. Drives the OOM pre-flight.
+    pub fn local_bytes(&self, name: &str, shape: &[usize], full_len: usize) -> usize {
+        match self.fused_slice(name, shape, full_len) {
+            Some((_, sub_len, _)) => sub_len,
+            None => full_len,
+        }
+    }
+}
+
 mod loader;
 pub mod mlx_int8;
 pub(crate) use loader::{check_oom_guard, estimate_has_fp8, estimate_load_bytes};

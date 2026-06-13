@@ -72,14 +72,23 @@ fn offset_norm_weights_plus_one(
 ///   weight_scale: [num_experts * n, k/group_size] FP8 per-group scales
 ///   input_scale: [num_experts * n] (optional, activation quantization)
 ///
-/// This function creates `num_experts` QuantizedWeight entries, each
-/// pointing to a different offset within the fused allocations.
+/// Returns a `num_experts`-long vector indexed by **global** expert id. Under
+/// EP the fused allocation only holds this rank's local experts
+/// `[local_start, local_end)` (the weight loader sliced the leading expert
+/// dimension), so global expert `e` maps to local row block `e - local_start`.
+/// Remote experts get [`QuantizedWeight::null`] — kernels detect the NULL
+/// pointers, write zero, and an all-reduce combines ranks. This matches the
+/// per-expert tensor EP path, which stores `ExpertWeight::null()` for experts
+/// not present locally.
+#[allow(clippy::too_many_arguments)]
 fn slice_fused_experts(
     fused_weight: DevicePtr,
     fused_scale: DevicePtr,
     fused_input_scale: DevicePtr,
     global_scale_2: f32,
     num_experts: usize,
+    local_start: usize,
+    local_end: usize,
     n: usize,
     k: usize,
 ) -> Vec<QuantizedWeight> {
@@ -89,15 +98,22 @@ fn slice_fused_experts(
     let input_scale_bytes_per_expert = n * 4;
 
     (0..num_experts)
-        .map(|e| QuantizedWeight {
-            weight: fused_weight.offset(e * packed_bytes_per_expert),
-            weight_scale: fused_scale.offset(e * scale_bytes_per_expert),
-            weight_scale_2: global_scale_2,
-            input_scale: if fused_input_scale == DevicePtr::NULL {
-                DevicePtr::NULL
-            } else {
-                fused_input_scale.offset(e * input_scale_bytes_per_expert)
-            },
+        .map(|e| {
+            if e < local_start || e >= local_end {
+                return QuantizedWeight::null();
+            }
+            // Local index within this rank's slice of the fused tensor.
+            let li = e - local_start;
+            QuantizedWeight {
+                weight: fused_weight.offset(li * packed_bytes_per_expert),
+                weight_scale: fused_scale.offset(li * scale_bytes_per_expert),
+                weight_scale_2: global_scale_2,
+                input_scale: if fused_input_scale == DevicePtr::NULL {
+                    DevicePtr::NULL
+                } else {
+                    fused_input_scale.offset(li * input_scale_bytes_per_expert)
+                },
+            }
         })
         .collect()
 }

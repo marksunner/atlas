@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::{SafetensorsLoader, WeightLoader, WeightStore};
+use super::{EpShard, SafetensorsLoader, WeightLoader, WeightStore};
 use crate::gpu::GpuBackend;
 
 impl WeightLoader for SafetensorsLoader {
@@ -17,6 +17,11 @@ impl WeightLoader for SafetensorsLoader {
         oom_reserve_bytes: usize,
     ) -> Result<WeightStore> {
         let skip_fn = |name: &str| self.should_skip_tensor(name);
+        let ep = EpShard {
+            ep_rank: self.ep_rank,
+            ep_world_size: self.ep_world_size,
+            num_experts: self.num_experts,
+        };
 
         // Collect all safetensor files (indexed, single, or unindexed shards).
         // Supports both HuggingFace standard (model.safetensors*) and Mistral
@@ -78,8 +83,8 @@ impl WeightLoader for SafetensorsLoader {
         //   NVFP4 (Sehyo): ~2.0x  (store aliased + transposed/predequant copies)
         //   FP8 native:    ~1.5x  (store stays FP8, only attention prefill gets NVFP4 copies)
         {
-            let estimated = estimate_load_bytes(&shard_files, &skip_fn)?;
-            let has_fp8 = estimate_has_fp8(&shard_files, &skip_fn)?;
+            let estimated = estimate_load_bytes(&shard_files, &skip_fn, &ep)?;
+            let has_fp8 = estimate_has_fp8(&shard_files, &skip_fn, &ep)?;
             let overhead_multiplier: f64 =
                 self.peak_memory_multiplier
                     .unwrap_or(if has_fp8 { 1.5 } else { 1.3 });
@@ -124,15 +129,16 @@ impl WeightLoader for SafetensorsLoader {
                 oom_reserve_bytes,
                 &skip_fn,
                 self.peak_memory_multiplier,
+                &ep,
             )?
         } else if shard_files.len() == 1 {
-            load_single(&shard_files[0], gpu, oom_reserve_bytes, &skip_fn)?
+            load_single(&shard_files[0], gpu, oom_reserve_bytes, &skip_fn, &ep)?
         } else {
             tracing::info!("Loading {} unindexed safetensor shards", shard_files.len());
             let initial_free = gpu.free_memory()?;
             let mut combined = HashMap::new();
             for (i, shard) in shard_files.iter().enumerate() {
-                let map = load_single(shard, gpu, oom_reserve_bytes, &skip_fn)?;
+                let map = load_single(shard, gpu, oom_reserve_bytes, &skip_fn, &ep)?;
                 let free_now = gpu.free_memory().unwrap_or(0);
                 let used = initial_free.saturating_sub(free_now);
                 tracing::info!(
@@ -157,7 +163,9 @@ impl WeightLoader for SafetensorsLoader {
         let no_skip = |_: &str| false;
         let extra = model_dir.join("extra_weights.safetensors");
         if extra.exists() {
-            let extra_weights = load_single(&extra, gpu, oom_reserve_bytes, &no_skip)?;
+            // Extra weights (MTP) are fully replicated — never EP-sliced.
+            let extra_weights =
+                load_single(&extra, gpu, oom_reserve_bytes, &no_skip, &EpShard::inactive())?;
             tracing::info!(
                 "Loaded {} extra weight tensors from extra_weights.safetensors",
                 extra_weights.len()
@@ -245,6 +253,7 @@ pub(crate) fn read_safetensor_header(
 pub(crate) fn estimate_load_bytes(
     files: &[std::path::PathBuf],
     skip_fn: &dyn Fn(&str) -> bool,
+    ep: &EpShard,
 ) -> Result<usize> {
     let mut total = 0usize;
     for path in files {
@@ -265,7 +274,9 @@ pub(crate) fn estimate_load_bytes(
                 | safetensors::Dtype::F8_E5M2 => 1,
                 _ => 2,
             };
-            total += numel * elem_bytes;
+            // Fused MoE projections are EP-sliced at load time, so count only
+            // this rank's portion to keep the OOM pre-flight accurate.
+            total += ep.local_bytes(&name, &shape, numel * elem_bytes);
         }
     }
     Ok(total)
@@ -277,6 +288,7 @@ pub(crate) fn estimate_load_bytes(
 pub(crate) fn estimate_has_fp8(
     files: &[std::path::PathBuf],
     skip_fn: &dyn Fn(&str) -> bool,
+    ep: &EpShard,
 ) -> Result<bool> {
     let mut fp8_bytes = 0usize;
     let mut total_bytes = 0usize;
@@ -298,7 +310,7 @@ pub(crate) fn estimate_has_fp8(
                 | safetensors::Dtype::F8_E5M2 => 1,
                 _ => 2,
             };
-            let bytes = numel * elem_bytes;
+            let bytes = ep.local_bytes(&name, &shape, numel * elem_bytes);
             total_bytes += bytes;
             if matches!(
                 dtype,

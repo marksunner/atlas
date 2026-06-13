@@ -90,9 +90,10 @@ impl ModelCapabilities {
             has_ssm_layers: has_ssm || has_mamba2,
             has_attention_layers: has_attention,
             has_moe_layers: has_moe,
-            // Models with SSM layers support <think> tokens. Long-term this should
-            // be derived from tokenizer vocabulary, not architecture.
-            supports_thinking: has_ssm || has_mamba2,
+            // SSM/Mamba models support <think>; pure-attention thinking models
+            // (Step 3.7) opt in via config.supports_thinking. Long-term this
+            // should be derived from tokenizer vocabulary, not architecture.
+            supports_thinking: has_ssm || has_mamba2 || config.supports_thinking,
             supports_vision: has_vision,
             has_mtp,
             ssm_architecture: ssm_arch,

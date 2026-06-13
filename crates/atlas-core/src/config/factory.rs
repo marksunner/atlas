@@ -98,6 +98,7 @@ impl ModelConfig {
             mtp_transformer_layers: 0,
             rotary_dim: 0,
             use_fp32_residual: false,
+            supports_thinking: false,
             dflash_capture_layers: Vec::new(),
         }
     }

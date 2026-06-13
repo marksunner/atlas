@@ -292,14 +292,16 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
-            // Non-MoE (31B dense)
+            // Single FFN path: dense FFN (31B) OR routed MoE.
+            // The dumps bracket the FFN/MoE forward so a divergence in the
+            // single-token expert kernels shows up as moe_in (OK) → moe_out (bad).
             if gemma4_diag {
                 diag_norm(
                     ctx.gpu,
                     normed2,
                     h,
                     stream,
-                    &format!("L{:02} normed2", self.attn_layer_idx),
+                    &format!("L{:02} moe_in(normed2)", self.attn_layer_idx),
                 );
             }
             let dense_out = self.ffn.forward(normed2, ctx, stream)?;
@@ -309,7 +311,7 @@ impl Qwen3AttentionLayer {
                     dense_out,
                     h,
                     stream,
-                    &format!("L{:02} dense_out", self.attn_layer_idx),
+                    &format!("L{:02} moe_out", self.attn_layer_idx),
                 );
             }
             if let Some(ref post_norm) = self.post_ffn_out_norm {

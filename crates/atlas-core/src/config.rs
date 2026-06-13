@@ -335,6 +335,13 @@ pub struct ModelConfig {
     #[serde(skip)]
     pub use_fp32_residual: bool,
 
+    /// Model supports `<think>` reasoning despite having no SSM/Mamba layers.
+    /// Set true by pure-attention thinking models (Step 3.7). Feeds
+    /// `ModelCapabilities::supports_thinking`. Defaults false so existing
+    /// models are unchanged.
+    #[serde(default)]
+    pub supports_thinking: bool,
+
     /// Target-model layer indices to capture intermediate hidden states from
     /// for DFlash speculative decoding. Sourced from the drafter's
     /// `dflash_config.target_layer_ids` (e.g., `[1, 10, 19, 28, 37]` for

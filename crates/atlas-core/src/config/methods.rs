@@ -33,12 +33,12 @@ impl ModelConfig {
         }
     }
 
-    /// Number of full attention layers.
+    /// Number of attention layers backed by a KV cache (full + sliding window).
     pub fn num_attention_layers(&self) -> usize {
         if !self.layer_types.is_empty() {
             self.layer_types
                 .iter()
-                .filter(|t| **t == LayerType::FullAttention)
+                .filter(|t| matches!(t, LayerType::FullAttention | LayerType::SlidingAttention))
                 .count()
         } else {
             self.num_hidden_layers

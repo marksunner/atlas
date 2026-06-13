@@ -213,11 +213,21 @@ fn load_moe_ffn(
         let (dp_w, dp_s, dp_is, dp_s2) =
             load_fused_nvfp4(store, &format!("{moe_p}.down_proj"), gpu)?;
 
-        let gate_projs =
-            slice_fused_experts(gp_w, gp_s, gp_is, gp_s2, config.num_experts, inter, h);
-        let up_projs = slice_fused_experts(up_w, up_s, up_is, up_s2, config.num_experts, inter, h);
-        let down_projs =
-            slice_fused_experts(dp_w, dp_s, dp_is, dp_s2, config.num_experts, h, inter);
+        // Under EP the fused store tensors hold only this rank's local experts
+        // (the weight loader sliced the leading expert dim). Map global expert
+        // ids → local rows; remote experts become NULL (zeroed + all-reduced).
+        // EP off → range is [0, num_experts) and every expert is local.
+        let (local_start, local_end) = config.local_expert_range();
+
+        let gate_projs = slice_fused_experts(
+            gp_w, gp_s, gp_is, gp_s2, config.num_experts, local_start, local_end, inter, h,
+        );
+        let up_projs = slice_fused_experts(
+            up_w, up_s, up_is, up_s2, config.num_experts, local_start, local_end, inter, h,
+        );
+        let down_projs = slice_fused_experts(
+            dp_w, dp_s, dp_is, dp_s2, config.num_experts, local_start, local_end, h, inter,
+        );
 
         (0..config.num_experts)
             .map(|e| ExpertWeight {
@@ -423,7 +433,16 @@ fn load_attention_layer(
     }
 
     if is_sliding {
+        // Sliding layers: local RoPE base (θ=1e4) over the FULL head_dim
+        // (partial_rotary_factor=1.0 → rotary_dim=128).
         layer.set_rope_overrides(10000.0, config.head_dim as u32);
+    } else {
+        // Full-attention layers: global RoPE base (θ=5e6) over the PARTIAL
+        // rotary dims (partial_rotary_factor=0.5 → rotary_dim=64). Set
+        // explicitly so correctness does not depend on the global fallback.
+        // Matches llama.cpp step35.cpp (`n_rot_full = n_rot/2`) and HF
+        // partial_rotary_factors[full]=0.5.
+        layer.set_rope_overrides(config.rope_theta as f32, config.rotary_dim() as u32);
     }
 
     if let Some(gw) = g_proj_weight {

@@ -17,6 +17,7 @@ qwen3_vl_moe = "hermes"       # Qwen3-VL-30B
 mistral     = "mistral"       # Mistral Small 4 — native [TOOL_CALLS]name[ARGS]{json}
 gemma4      = "gemma4"        # Gemma-4 — native format: <|tool_call>call:name{...}<tool_call|>
 minimax_m2  = "minimax_xml"    # MiniMax M2 — <minimax:tool_call><invoke name=""><parameter name="">...
+step3p7     = "hermes"        # Step 3.7 Flash — JSON tool calls (matches step3p7.jinja Hermes rendering)
 
 # Default reasoning parser per model_type.
 # Override at runtime with --reasoning-parser <format>.
@@ -40,3 +41,4 @@ qwen3_next  = "qwen"
 qwen3_vl_moe = "qwen"
 mistral     = "mistral"
 minimax_m2  = "minimax"        # MiniMax M2/M2.7 — <think>...</think>, own identity
+step3p7     = "qwen"           # Step 3.7 Flash — <think>...</think>, Qwen-compatible tag contract

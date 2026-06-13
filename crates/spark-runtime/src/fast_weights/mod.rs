@@ -18,7 +18,7 @@
 
 use crate::gpu::GpuBackend;
 use crate::weights::{
-    WeightLoader, WeightStore, WeightTensor, check_oom_guard, estimate_has_fp8,
+    EpShard, WeightLoader, WeightStore, WeightTensor, check_oom_guard, estimate_has_fp8,
     estimate_load_bytes, evict_page_cache, parse_expert_index,
 };
 use anyhow::{Context, Result, bail};
@@ -118,6 +118,11 @@ impl WeightLoader for FastSafetensorsLoader {
         oom_reserve_bytes: usize,
     ) -> Result<WeightStore> {
         let skip_fn = |name: &str| self.should_skip_tensor(name);
+        let ep = EpShard {
+            ep_rank: self.ep_rank,
+            ep_world_size: self.ep_world_size,
+            num_experts: self.num_experts,
+        };
 
         // Resolve shard list (sharded index, single file, or unindexed shards).
         let (shard_files, tensor_to_shard): (Vec<PathBuf>, Option<HashMap<String, String>>) =
@@ -125,8 +130,8 @@ impl WeightLoader for FastSafetensorsLoader {
 
         // Pre-flight OOM estimate (identical to SafetensorsLoader).
         {
-            let estimated = estimate_load_bytes(&shard_files, &skip_fn)?;
-            let has_fp8 = estimate_has_fp8(&shard_files, &skip_fn)?;
+            let estimated = estimate_load_bytes(&shard_files, &skip_fn, &ep)?;
+            let has_fp8 = estimate_has_fp8(&shard_files, &skip_fn, &ep)?;
             let mult = self
                 .peak_memory_multiplier
                 .unwrap_or(if has_fp8 { 1.5 } else { 1.3 });
@@ -144,13 +149,29 @@ impl WeightLoader for FastSafetensorsLoader {
                 has_fp8,
             );
             if peak + oom_reserve_bytes > free {
-                bail!(
-                    "OOM pre-flight: peak {:.2} GB + {:.2} GB reserve exceeds {:.2} GB free. \
-                     Use a smaller quantization or add more GPUs for EP.",
-                    gib(peak),
-                    gib(oom_reserve_bytes),
-                    gib(free),
-                );
+                // Escape hatch: the pre-flight estimate can be conservative (e.g.
+                // fused MoE under EP, UVM/offload paths that don't keep peak
+                // resident). Setting ATLAS_SKIP_OOM_PREFLIGHT downgrades the hard
+                // bail to a warning and lets the load proceed — the per-shard
+                // check_oom_guard below still aborts if we actually run out.
+                if std::env::var("ATLAS_SKIP_OOM_PREFLIGHT").is_ok() {
+                    tracing::warn!(
+                        "OOM pre-flight: peak {:.2} GB + {:.2} GB reserve exceeds {:.2} GB free, \
+                         but ATLAS_SKIP_OOM_PREFLIGHT is set — proceeding anyway.",
+                        gib(peak),
+                        gib(oom_reserve_bytes),
+                        gib(free),
+                    );
+                } else {
+                    bail!(
+                        "OOM pre-flight: peak {:.2} GB + {:.2} GB reserve exceeds {:.2} GB free. \
+                         Use a smaller quantization or add more GPUs for EP. \
+                         Set ATLAS_SKIP_OOM_PREFLIGHT=1 to bypass this check.",
+                        gib(peak),
+                        gib(oom_reserve_bytes),
+                        gib(free),
+                    );
+                }
             }
         }
 
@@ -190,6 +211,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 tensor_filter.as_deref(),
                 gpu,
                 &skip_fn,
+                &ep,
                 self.try_direct_io,
                 self.direct_io_tensor_cap,
                 &mut weights,
@@ -220,11 +242,13 @@ impl WeightLoader for FastSafetensorsLoader {
         if extra.exists() {
             tracing::info!("Fast-loading extra_weights.safetensors");
             let mut extra_offload = false;
+            // Extra weights (MTP) are fully replicated — never EP-sliced.
             load_shard_fast(
                 &extra,
                 None,
                 gpu,
                 &no_skip,
+                &EpShard::inactive(),
                 self.try_direct_io,
                 self.direct_io_tensor_cap,
                 &mut weights,
@@ -252,6 +276,7 @@ fn load_shard_fast(
     tensor_filter: Option<&[String]>,
     gpu: &dyn GpuBackend,
     skip_fn: &dyn Fn(&str) -> bool,
+    ep: &EpShard,
     try_direct_io: bool,
     direct_io_tensor_cap: usize,
     out: &mut HashMap<String, WeightTensor>,
@@ -270,6 +295,20 @@ fn load_shard_fast(
         tensors.retain(|t| allow_set.contains(t.name.as_str()));
     }
     tensors.retain(|t| !skip_fn(&t.name));
+
+    // EP: for fused MoE projections, narrow each tensor's read window to this
+    // rank's expert rows. Because the expert dim is the leading (contiguous)
+    // axis, the local rows are a single byte sub-range — adjust offset/len and
+    // record the local shape so the stored WeightTensor reflects the slice.
+    // `fused_slice` returns None when EP is off or the tensor isn't fused, so
+    // this is a no-op on the single-GPU path.
+    for t in tensors.iter_mut() {
+        if let Some((sub_off, sub_len, local_shape)) = ep.fused_slice(&t.name, &t.shape, t.len) {
+            t.abs_offset += sub_off as u64;
+            t.len = sub_len;
+            t.shape = local_shape;
+        }
+    }
 
     // Per-shard heuristic: above `direct_io_tensor_cap` tensors, O_DIRECT's
     // per-tensor syscall + 4 KiB alignment overhead costs more than kernel

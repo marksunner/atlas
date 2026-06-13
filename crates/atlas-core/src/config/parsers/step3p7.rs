@@ -61,7 +61,40 @@ pub(crate) fn parse_step3p7(raw: &serde_json::Value) -> Result<ModelConfig> {
             let first = arr.first().and_then(Value::as_f64).unwrap_or(5000000.0);
             obj.insert("rope_theta".to_string(), Value::from(first));
         }
-        // partial_rotary_factors: array → remove (we handle via partial_rotary_factor scalar)
+        // partial_rotary_factors: per-layer array. Full-attention layers use 0.5
+        // (rotary_dim = 0.5*head_dim = 64), sliding layers use 1.0 (rotary_dim = 128).
+        // Reference: HF modeling_step3p7.py (partial_rotary_factors[layer_idx]) and
+        // llama.cpp step35.cpp (`n_rot_full = n_rot_full / 2`). The HF converter even
+        // asserts: [1.0 if sliding else 0.5 for lt in layer_types] == partial_rotary_factors.
+        //
+        // Atlas applies per-layer rotary_dim via per-layer overrides set in the weight
+        // loader: SLIDING layers get an explicit rotary_dim=head_dim override, while
+        // FULL-attention layers consume this global scalar as their fallback. So the
+        // scalar must be the FULL-attention factor (0.5). Extract it (indexed by the
+        // first full_attention layer, mirroring the rope_theta first-element handling
+        // above; falling back to the minimum factor, which is always the full value)
+        // BEFORE removing the array, so `partial_rotary_factor` deserializes correctly
+        // and `config.rotary_dim()` returns 64 for full-attention layers.
+        let full_prf = obj
+            .get("partial_rotary_factors")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                let full_idx = obj
+                    .get("layer_types")
+                    .and_then(Value::as_array)
+                    .and_then(|lts| {
+                        lts.iter()
+                            .position(|lt| lt.as_str() == Some("full_attention"))
+                    })
+                    .unwrap_or(0);
+                arr.get(full_idx)
+                    .and_then(Value::as_f64)
+                    .or_else(|| arr.iter().filter_map(Value::as_f64).reduce(f64::min))
+                    .unwrap_or(0.5)
+            });
+        if let Some(prf) = full_prf {
+            obj.insert("partial_rotary_factor".to_string(), Value::from(prf));
+        }
         obj.remove("partial_rotary_factors");
         // Remove other array fields that serde can't handle
         obj.remove("swiglu_limits");
@@ -143,13 +176,14 @@ pub(crate) fn parse_step3p7(raw: &serde_json::Value) -> Result<ModelConfig> {
     }
 
     // ── RoPE configuration ──────────────────────────────────────────────
-    // KNOWN LIMITATION: Step 3.7 uses per-layer rope_theta and
-    // partial_rotary_factors arrays (theta=5e6 for full-attention layers,
-    // theta=1e4 for sliding layers; prf=0.5 for full, 1.0 for sliding).
-    // Atlas ModelConfig currently supports only a single scalar for each.
-    // We take the first element (full-attention value). This means sliding
-    // layers will use incorrect RoPE parameters — acceptable for initial
-    // bring-up but will need per-layer support for correct output.
+    // Step 3.7 uses per-layer rope_theta (5e6 full / 1e4 sliding) and
+    // partial_rotary_factors (0.5 full / 1.0 sliding). Atlas applies these
+    // PER-LAYER via rope_*_override fields set in the weight loader
+    // (weight_loader/step3p7/load_layers.rs): sliding layers get explicit
+    // theta=1e4 + rotary_dim=128 overrides; full-attention layers consume the
+    // global scalars below as their fallback. We therefore set the global
+    // scalars to the FULL-attention values (theta=5e6 first element,
+    // partial_rotary_factor=0.5 → rotary_dim=64).
     if let Some(rt) = text_config.get("rope_theta") {
         if let Some(theta) = rt.as_f64() {
             config.rope_theta = theta;
@@ -221,11 +255,12 @@ pub(crate) fn parse_step3p7(raw: &serde_json::Value) -> Result<ModelConfig> {
         .unwrap_or(true);
 
     // ── Layer types ─────────────────────────────────────────────────────
-    // KNOWN LIMITATION: Step 3.7 has mixed attention (12 full + 33 sliding
-    // in 45 hidden layers). Atlas currently maps both to FullAttention.
-    // The sliding_window value (512) is set globally but not applied
-    // per-layer. For correct behaviour, Atlas would need per-layer
-    // attention type dispatch. Acceptable for initial bring-up.
+    // Step 3.7 has mixed attention (12 full + 33 sliding in 45 hidden layers).
+    // Each entry in `layer_types` is mapped to its corresponding LayerType
+    // (full_attention → FullAttention, sliding_attention → SlidingAttention),
+    // so the attention type is dispatched per-layer. load_layers.rs then
+    // applies the per-layer sliding window and RoPE overrides for the
+    // sliding-attention layers.
     if config.layer_types.is_empty()
         && let Some(list) = text_config.get("layer_types").and_then(Value::as_array)
     {
@@ -273,14 +308,15 @@ pub(crate) fn parse_step3p7(raw: &serde_json::Value) -> Result<ModelConfig> {
     // per head), unlike Qwen 3.5's interleaved Q+G pattern where the gate
     // has the same dimension as Q.
     //
-    // Atlas's gated attention pipeline assumes Q+G are interleaved in a
-    // single [2*q_dim, hidden] weight, and the deinterleave+sigmoid_gate_mul
-    // kernels work element-wise. Step 3.7's per-head gate would require a
-    // different kernel (broadcast over head_dim) or weight tiling.
+    // `attn_gated` controls only the interleaved Q+G path, where Q and the
+    // gate share a single [2*q_dim, hidden] weight processed by the
+    // element-wise deinterleave + sigmoid_gate_mul kernels. Step 3.7 does not
+    // use that layout, so `attn_gated` stays false here.
     //
-    // For now: disable gating. The model will produce slightly different
-    // output without the attention gate, but should still be coherent.
-    // TODO: Implement per-head g_proj gating for Step 3.7.
+    // The per-head g_proj gate is handled separately: load_layers.rs loads the
+    // g_proj weight into the layer's head_gate_weight, and attention_forward.rs
+    // applies it via the sigmoid_gate_mul_head_broadcast kernel (broadcasting
+    // each head's scalar gate over head_dim). The gate IS implemented and active.
     config.attn_gated = false;
 
     // ── MTP (Multi-Token Prediction) ────────────────────────────────────
@@ -319,8 +355,14 @@ pub(crate) fn parse_step3p7(raw: &serde_json::Value) -> Result<ModelConfig> {
         config.vision = parse_vision_config(raw);
     }
 
-    // Step 3.7 uses FP32 residual accumulation for precision across 81 layers.
-    config.use_fp32_residual = true;
+    // FP32 residual accumulation is not wired up for Step 3.7 (the BF16→FP32
+    // promotion kernel is not connected), so leave it disabled to avoid a dtype
+    // mismatch in the residual path.
+    config.use_fp32_residual = false;
+
+    // Step 3.7 is a pure-attention reasoning model (no SSM/Mamba layers), so the
+    // architecture-derived supports_thinking would be false. Opt in explicitly.
+    config.supports_thinking = true;
 
     finalize_config(&mut config, raw)?;
     Ok(config)
