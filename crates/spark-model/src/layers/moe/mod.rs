@@ -104,6 +104,19 @@ pub struct MoeLayer {
     moe_act_mul: KernelHandle,
     /// When true, decode uses the sorted prefill path (avoids fused SiLU kernels).
     gelu_activation: bool,
+    /// SwiGLU clamp kernel (Step 3.7 `swiglu_limits`). Handle 0 on targets
+    /// that don't ship the module; clamp calls are gated on the limits below.
+    swiglu_clamp_k: KernelHandle,
+    /// Pre-silu gate threshold x* for ROUTED experts (silu(x*) = limit),
+    /// 0.0 = clamping disabled. Set by the loader for layers whose
+    /// `config.swiglu_limits[layer]` is non-zero (Step 3.7: 7.0 on 43/44).
+    pub swiglu_gate_max: f32,
+    /// Symmetric up-projection clamp for ROUTED experts (the raw limit).
+    pub swiglu_up_limit: f32,
+    /// Pre-silu gate threshold x* for the SHARED expert.
+    pub swiglu_gate_max_shared: f32,
+    /// Symmetric up-projection clamp for the SHARED expert.
+    pub swiglu_up_limit_shared: f32,
     moe_unpermute_reduce: KernelHandle,
     moe_batched_blend: KernelHandle,
     /// Pointer tables for batched expert dispatch.
@@ -275,6 +288,90 @@ pub struct MoeLayer {
     // path. Used to test whether the kernel choice is the dominant cause
     // of low DFlash drafter acceptance on FP4/FP8 targets.
     pub is_dflash_capture_layer: bool,
+}
+
+impl MoeLayer {
+    /// Configure per-layer SwiGLU clamping (Step 3.7 `swiglu_limits` /
+    /// `swiglu_limits_shared`, vLLM `swiglustep`). Called by the loader
+    /// after construction for layers whose config limit is non-zero.
+    ///
+    /// Converts each limit L into the pre-silu gate threshold x* with
+    /// silu(x*) = L (fixed-point iteration x = L·(1 + e^-x), converges in
+    /// a handful of steps for L ≥ 1), so the in-place pre-clamp of the
+    /// gate GEMM output is exactly equivalent to clamping silu(gate).
+    pub fn set_swiglu_limits(&mut self, routed_limit: f64, shared_limit: f64) {
+        fn pre_silu_threshold(limit: f64) -> f32 {
+            let mut x = limit;
+            for _ in 0..50 {
+                x = limit * (1.0 + (-x).exp());
+            }
+            x as f32
+        }
+        if routed_limit > 0.0 {
+            self.swiglu_gate_max = pre_silu_threshold(routed_limit);
+            self.swiglu_up_limit = routed_limit as f32;
+        }
+        if shared_limit > 0.0 {
+            self.swiglu_gate_max_shared = pre_silu_threshold(shared_limit);
+            self.swiglu_up_limit_shared = shared_limit as f32;
+        }
+        if (routed_limit > 0.0 || shared_limit > 0.0) && self.swiglu_clamp_k.0 == 0 {
+            tracing::warn!(
+                "swiglu_limits configured (routed={routed_limit}, shared={shared_limit}) \
+                 but the swiglu_clamp kernel is not loaded — clamping will be SKIPPED"
+            );
+        }
+    }
+
+    /// Clamp routed-expert gate/up GEMM outputs in place. No-op unless
+    /// this layer has routed limits configured and the kernel is loaded.
+    pub(crate) fn clamp_routed_gate_up(
+        &self,
+        gpu: &dyn GpuBackend,
+        gate: DevicePtr,
+        up: DevicePtr,
+        num_elements: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if self.swiglu_gate_max <= 0.0 || self.swiglu_clamp_k.0 == 0 {
+            return Ok(());
+        }
+        ops::swiglu_clamp(
+            gpu,
+            self.swiglu_clamp_k,
+            gate,
+            up,
+            self.swiglu_gate_max,
+            self.swiglu_up_limit,
+            num_elements,
+            stream,
+        )
+    }
+
+    /// Clamp shared-expert gate/up GEMM outputs in place. No-op unless
+    /// this layer has shared limits configured and the kernel is loaded.
+    pub(crate) fn clamp_shared_gate_up(
+        &self,
+        gpu: &dyn GpuBackend,
+        gate: DevicePtr,
+        up: DevicePtr,
+        num_elements: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if self.swiglu_gate_max_shared <= 0.0 || self.swiglu_clamp_k.0 == 0 {
+            return Ok(());
+        }
+        ops::swiglu_clamp(
+            gpu,
+            self.swiglu_clamp_k,
+            gate,
+            up,
+            self.swiglu_gate_max_shared,
+            self.swiglu_up_limit_shared,
+            num_elements,
+            stream,
+        )
+    }
 }
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────

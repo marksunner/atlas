@@ -343,6 +343,34 @@ impl TransformerModel {
             devs
         };
 
+        // Sliding split pool: host-build the sliding slot twin. The
+        // marconi_skip paged replay can't occur here — prefix caching is
+        // force-disabled under the split pool — so no sliding block table
+        // is needed (attention is contiguous, table stays NULL like the
+        // full-pool one).
+        let ring_len = self.sliding_ring_len();
+        let (sliding_slot, sliding_block_table) = if ring_len > 0 {
+            debug_assert!(
+                !marconi_skip,
+                "marconi warm-hit replay is unreachable under the sliding split pool \
+                 (prefix caching is disabled at model construction)"
+            );
+            let sliding_slots: Vec<i64> = (seq_len_start..seq_len_start + proc_count)
+                .map(|i| self.sliding_slot_for(seq, i, bs, ring_len))
+                .collect();
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    sliding_slots.as_ptr() as *const u8,
+                    sliding_slots.len() * 8,
+                )
+            };
+            self.gpu
+                .copy_h2d_async(bytes, self.sliding_prefill_slots_base(), stream)?;
+            (self.sliding_prefill_slots_base(), DevicePtr::NULL)
+        } else {
+            (DevicePtr(0), DevicePtr(0))
+        };
+
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
             positions_h: meta_base,
@@ -352,6 +380,8 @@ impl TransformerModel {
             block_table: block_table_dev,
             max_blocks_per_seq: seq.block_table.len() as u32,
             num_seqs: 1,
+            sliding_slot,
+            sliding_block_table,
         };
 
         let ctx = ForwardContext {

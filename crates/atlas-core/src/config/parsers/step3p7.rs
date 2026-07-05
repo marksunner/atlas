@@ -53,15 +53,17 @@ pub(crate) fn parse_step3p7(raw: &serde_json::Value) -> Result<ModelConfig> {
             let last = arr.last().and_then(Value::as_u64).unwrap_or(1);
             obj.insert("eos_token_id".to_string(), Value::from(last));
         }
-        // rope_theta: per-layer array [5e6, 1e4, 1e4, 1e4, ...] → 5000000.0
-        // KNOWN LIMITATION: collapsing per-layer theta to scalar. Full-attention
-        // layers use θ=5e6, sliding layers use θ=1e4. We take the full-attention
-        // value (first element). See RoPE section below for documentation.
+        // rope_theta: per-layer array [5e6, 1e4, 1e4, 1e4, ...]. Serde needs
+        // the scalar field, so collapse to the full-attention value (first
+        // element) here; the full per-layer array is preserved into
+        // `config.rope_theta_per_layer` in the RoPE section below.
         if let Some(arr) = obj.get("rope_theta").and_then(Value::as_array) {
             let first = arr.first().and_then(Value::as_f64).unwrap_or(5000000.0);
             obj.insert("rope_theta".to_string(), Value::from(first));
         }
-        // partial_rotary_factors: array → remove (we handle via partial_rotary_factor scalar)
+        // partial_rotary_factors: per-layer array — serde can't take it as
+        // the scalar partial_rotary_factor; preserved into
+        // `config.partial_rotary_factors` in the RoPE section below.
         obj.remove("partial_rotary_factors");
         // Remove other array fields that serde can't handle
         obj.remove("swiglu_limits");
@@ -93,6 +95,12 @@ pub(crate) fn parse_step3p7(raw: &serde_json::Value) -> Result<ModelConfig> {
 
     // Override model_type to the top-level one
     config.model_type = "step3p7".to_string();
+    // The FP8 release's config.json omits rms_norm_eps; the serde default
+    // (1e-6) is wrong for Step 3.7 — the NVFP4 release and HF reference
+    // use 1e-5. Only apply when the field is genuinely absent.
+    if text_config.get("rms_norm_eps").is_none() {
+        config.rms_norm_eps = 1e-5;
+    }
     config.nested_config = true;
     // Weight prefix: Step 3.7 uses "model.language_model" for main layers
     config.weight_prefix = "model.language_model".to_string();
@@ -117,6 +125,23 @@ pub(crate) fn parse_step3p7(raw: &serde_json::Value) -> Result<ModelConfig> {
             .and_then(Value::as_u64)
             .unwrap_or(1280) as usize;
     }
+
+    // Dense-FFN layer count. Step 3.7 is a hybrid: layers 0-2 use a dense
+    // SwiGLU FFN sized by `intermediate_size`, layers 3-44 are MoE. The
+    // buffer arena reuses the expert intermediate buffers for the dense
+    // layers ([M, intermediate_size] writes), so BufferSizes::from_config
+    // must know dense layers exist to size for
+    // max(top_k × moe_intermediate_size, intermediate_size). Prefer the
+    // config's `moe_layers_enum` ("3,4,...,44" — layers NOT listed are
+    // dense); fall back to the known Step 3.7 architecture (3 dense).
+    config.num_dense_ffn_layers = text_config
+        .get("moe_layers_enum")
+        .and_then(Value::as_str)
+        .map(|s| {
+            let moe_count = s.split(',').filter(|t| !t.trim().is_empty()).count();
+            config.num_hidden_layers.saturating_sub(moe_count)
+        })
+        .unwrap_or(3);
 
     // Shared expert: Step 3.7 uses `share_expert_dim` (or `share_expert_dims`)
     config.shared_expert_intermediate_size = text_config
@@ -143,13 +168,41 @@ pub(crate) fn parse_step3p7(raw: &serde_json::Value) -> Result<ModelConfig> {
     }
 
     // ── RoPE configuration ──────────────────────────────────────────────
-    // KNOWN LIMITATION: Step 3.7 uses per-layer rope_theta and
-    // partial_rotary_factors arrays (theta=5e6 for full-attention layers,
-    // theta=1e4 for sliding layers; prf=0.5 for full, 1.0 for sliding).
-    // Atlas ModelConfig currently supports only a single scalar for each.
-    // We take the first element (full-attention value). This means sliding
-    // layers will use incorrect RoPE parameters — acceptable for initial
-    // bring-up but will need per-layer support for correct output.
+    // Step 3.7 uses per-layer rope_theta and partial_rotary_factors arrays
+    // (theta=5e6 / prf=0.5 for full-attention layers, theta=1e4 / prf=1.0
+    // for sliding layers). The scalar fields keep the full-attention values
+    // as the model-wide fallback; the arrays are preserved below so the
+    // weight loader can set per-layer overrides. Reference: vLLM
+    // step3p5.py `Step3p5Attention.__init__` — `rope_theta =
+    // rope_theta[self.layer_idx]`, `partial_rotary_factor =
+    // partial_rotary_factors[layer_idx]`.
+    if let Some(arr) = text_config.get("rope_theta").and_then(Value::as_array) {
+        config.rope_theta_per_layer = arr.iter().filter_map(Value::as_f64).collect();
+    }
+    if let Some(arr) = text_config
+        .get("partial_rotary_factors")
+        .and_then(Value::as_array)
+    {
+        config.partial_rotary_factors = arr.iter().filter_map(Value::as_f64).collect();
+    }
+
+    // ── SwiGLU clamp limits ────────────────────────────────────────────
+    // Step 3.7 trains layers 43/44 with clamped SwiGLU (`swiglustep`):
+    // silu(gate).clamp(max=limit) * up.clamp(-limit, limit), limit 7.0 for
+    // routed experts and 16.0 for the shared expert. Serving those layers
+    // unclamped lets activation spikes through the last two layers before
+    // the LM head. Reference: vLLM step3p5.py:349-367 (routed) / :113-121
+    // (shared). Preserved here per-layer; applied in spark-model MoE
+    // forward via the swiglu_clamp kernel.
+    if let Some(arr) = text_config.get("swiglu_limits").and_then(Value::as_array) {
+        config.swiglu_limits = arr.iter().filter_map(Value::as_f64).collect();
+    }
+    if let Some(arr) = text_config
+        .get("swiglu_limits_shared")
+        .and_then(Value::as_array)
+    {
+        config.swiglu_limits_shared = arr.iter().filter_map(Value::as_f64).collect();
+    }
     if let Some(rt) = text_config.get("rope_theta") {
         if let Some(theta) = rt.as_f64() {
             config.rope_theta = theta;
@@ -188,6 +241,55 @@ pub(crate) fn parse_step3p7(raw: &serde_json::Value) -> Result<ModelConfig> {
         config.partial_rotary_factor = prf;
     }
 
+    // ── Llama-3.1 "llama3" RoPE frequency scaling ────────────────────────
+    // Step 3.7 ships `rope_scaling = {"rope_type":"llama3","factor":2.0,
+    // "low_freq_factor":1.0,"high_freq_factor":4.0,
+    // "original_max_position_embeddings":8192}` and restricts it to
+    // full-attention layers via `yarn_only_types: ["full_attention"]`.
+    // This is the NTK-by-parts long-context transform (HF
+    // `_compute_llama3_parameters`). Without it, the 12 full-attention
+    // (long-range retrieval) layers rotate too fast past
+    // `original_max_position_embeddings`, so content generation degenerates
+    // beyond ~8K context while the sliding (local, window=512) layers — and
+    // hence the thinking phase — stay coherent. vLLM applies it the same
+    // way (`yarn_only_types`). The weight loader precomputes a per-layer
+    // llama3-scaled inv_freq table for the affected layers and routes them
+    // through the table-based RoPE kernel.
+    if let Some(rs) = text_config.get("rope_scaling") {
+        let rope_type = rs
+            .get("rope_type")
+            .or_else(|| rs.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if rope_type == "llama3" {
+            config.rope_llama3_factor = rs.get("factor").and_then(Value::as_f64).unwrap_or(1.0);
+            config.rope_llama3_low_freq_factor = rs
+                .get("low_freq_factor")
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0);
+            config.rope_llama3_high_freq_factor = rs
+                .get("high_freq_factor")
+                .and_then(Value::as_f64)
+                .unwrap_or(4.0);
+            config.rope_llama3_original_max_position = rs
+                .get("original_max_position_embeddings")
+                .and_then(Value::as_u64)
+                .unwrap_or(8192) as usize;
+        }
+    }
+    // `yarn_only_types` restricts the scaling to specific layer types
+    // (Step 3.7: ["full_attention"]). Read from the original text_config —
+    // the serde clone had this array field removed above.
+    config.rope_llama3_full_attention_only = text_config
+        .get("yarn_only_types")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .any(|s| s == "full_attention")
+        })
+        .unwrap_or(false);
+
     // Compute rotary_dim from partial_rotary_factor if not set explicitly.
     // Step 3.7: partial_rotary_factor=0.5, head_dim=128 → rotary_dim=64.
     if config.rotary_dim == 0 && config.partial_rotary_factor < 1.0 {
@@ -221,11 +323,9 @@ pub(crate) fn parse_step3p7(raw: &serde_json::Value) -> Result<ModelConfig> {
         .unwrap_or(true);
 
     // ── Layer types ─────────────────────────────────────────────────────
-    // KNOWN LIMITATION: Step 3.7 has mixed attention (12 full + 33 sliding
-    // in 45 hidden layers). Atlas currently maps both to FullAttention.
-    // The sliding_window value (512) is set globally but not applied
-    // per-layer. For correct behaviour, Atlas would need per-layer
-    // attention type dispatch. Acceptable for initial bring-up.
+    // Step 3.7 has mixed attention (12 full + 33 sliding in 45 hidden
+    // layers). The weight loader uses these per-layer types to set the
+    // sliding window (512), Q head count, and RoPE overrides on each layer.
     if config.layer_types.is_empty()
         && let Some(list) = text_config.get("layer_types").and_then(Value::as_array)
     {
@@ -242,9 +342,19 @@ pub(crate) fn parse_step3p7(raw: &serde_json::Value) -> Result<ModelConfig> {
             .collect();
     }
 
-    // Truncate layer_types to num_hidden_layers (Step 3.7 includes MTP layers in the array)
-    if config.layer_types.len() > config.num_hidden_layers && config.num_hidden_layers > 0 {
-        config.layer_types.truncate(config.num_hidden_layers);
+    // Truncate layer_types to num_hidden_layers (Step 3.7 includes MTP layers
+    // in the array). Same truncation for the per-layer RoPE arrays, which
+    // are indexed in lockstep with layer_types.
+    if config.num_hidden_layers > 0 {
+        if config.layer_types.len() > config.num_hidden_layers {
+            config.layer_types.truncate(config.num_hidden_layers);
+        }
+        if config.rope_theta_per_layer.len() > config.num_hidden_layers {
+            config.rope_theta_per_layer.truncate(config.num_hidden_layers);
+        }
+        if config.partial_rotary_factors.len() > config.num_hidden_layers {
+            config.partial_rotary_factors.truncate(config.num_hidden_layers);
+        }
     }
 
     // Sliding window size
@@ -270,17 +380,20 @@ pub(crate) fn parse_step3p7(raw: &serde_json::Value) -> Result<ModelConfig> {
     // ── Attention gate ──────────────────────────────────────────────────
     // Step 3.7 has `use_head_wise_attn_gate: true` with a separate `g_proj`
     // weight [num_q_heads, hidden_size]. This is a PER-HEAD gate (one scalar
-    // per head), unlike Qwen 3.5's interleaved Q+G pattern where the gate
-    // has the same dimension as Q.
+    // per head, sigmoid, broadcast over head_dim, applied to the attention
+    // output before o_proj) — NOT Qwen 3.5's interleaved Q+G pattern where
+    // the gate has the same dimension as Q. Reference: vLLM step3p5.py
+    // `Step3p5Attention.forward`:
+    //   attn_output.view(..., num_heads, head_dim)
+    //     * g_proj(hidden_states).unsqueeze(-1).sigmoid()
     //
-    // Atlas's gated attention pipeline assumes Q+G are interleaved in a
-    // single [2*q_dim, hidden] weight, and the deinterleave+sigmoid_gate_mul
-    // kernels work element-wise. Step 3.7's per-head gate would require a
-    // different kernel (broadcast over head_dim) or weight tiling.
-    //
-    // For now: disable gating. The model will produce slightly different
-    // output without the attention gate, but should still be coherent.
-    // TODO: Implement per-head g_proj gating for Step 3.7.
+    // `attn_gated` stays false because in Atlas that flag selects the
+    // Qwen3-Next interleaved pipeline (q_proj output doubled to 2*q_dim +
+    // element-wise deinterleave/sigmoid_gate_mul kernels), which would
+    // misread Step 3.7's plain [nq*hd, hidden] q_proj. The per-head gate is
+    // wired independently: the Step 3.7 weight loader loads g_proj into
+    // `Qwen3AttentionLayer::head_gate_weight`, and every attention forward
+    // path applies it via the `sigmoid_gate_mul_head_broadcast` kernel.
     config.attn_gated = false;
 
     // ── MTP (Multi-Token Prediction) ────────────────────────────────────

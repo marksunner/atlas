@@ -61,6 +61,14 @@ pub struct BufferSizes {
     /// GDN FLA chunked-prefill scratch (single buffer, sub-divided W|U|S|uc).
     /// 0 unless the model is a 128-dim-linear-head GDN model (ATLAS_GDN_FLA path).
     pub gdn_fla_scratch: usize,
+    /// Sliding-window split-pool metadata staging. 0 unless the model has
+    /// hybrid full+sliding attention (Step 3.7 / Gemma-4). Layout (see
+    /// `SLIDING_META_*` constants in spark-model):
+    ///   [0 .. 256)                : decode/verify sliding slots (32 × i64)
+    ///   [256 .. 256+32*mb*4)      : decode/verify ring-expanded block
+    ///                               tables (32 rows × max_blocks × i32)
+    ///   [tables_end .. +m*8)      : prefill sliding slots (m × i64)
+    pub sliding_meta: usize,
 }
 
 impl BufferSizes {
@@ -153,8 +161,29 @@ impl BufferSizes {
         // Batched expert output buffers for MoE (or dense FFN).
         // Sized for max(K=3 verify, prefill chunk) × top_k experts.
         let k_max = m.max(3); // prefill chunk or K=3 verify, whichever larger
+        // Hybrid dense+MoE models (Step 3.7: layers 0-2 dense with
+        // `intermediate_size`, 3-44 MoE with `moe_intermediate_size`;
+        // DeepSeek/Mistral-style `decoder_sparse_step` staggering) run
+        // their dense-FFN layers through these SAME buffers as
+        // [M, intermediate_size] (`DenseFfnLayer::forward_prefill`).
+        // Sizing purely from the MoE dims overflows the buffers on any
+        // prefill chunk where intermediate_size > top_k ×
+        // moe_intermediate_size — an async out-of-bounds write that
+        // surfaces as CUDA_ERROR_ILLEGAL_ADDRESS (700) at the next
+        // stream sync (observed: Step 3.7 EP=2, 26K-token prompt,
+        // "Prefill chunk layer 2 failed"). Small prompts fit inside the
+        // slack (M_small × intermediate_size < M_max × top_k ×
+        // moe_intermediate_size), which is why short requests worked.
+        // Take the max of both consumers when dense layers exist.
+        let has_dense_ffn =
+            config.num_dense_ffn_layers > 0 || config.decoder_sparse_step > 1;
         let expert_inter = if config.num_experts > 0 {
-            k_max * config.num_experts_per_tok * config.moe_intermediate_size
+            let moe_need = k_max * config.num_experts_per_tok * config.moe_intermediate_size;
+            if has_dense_ffn {
+                moe_need.max(k_max * config.intermediate_size)
+            } else {
+                moe_need
+            }
         } else {
             k_max * config.intermediate_size
         };
@@ -193,6 +222,26 @@ impl BufferSizes {
         // for K_DIM=V_DIM=128); 0 otherwise so BufferArena allocs NULL and the
         // ATLAS_GDN_FLA dispatch stays disabled. Layout per region:
         //   W  [nt*nv][CHUNK][kd] bf16 ; U,uc [nt*nv][CHUNK][vd] bf16 ; S [nt*nv][kd][vd] f32.
+        // Sliding split-pool metadata staging: only hybrid full+sliding
+        // attention models pay for it. Sized from the SAME max_blocks /
+        // bt_rows as the decode/verify scratch region so the two can
+        // never disagree about capacity.
+        let has_hybrid_sliding = config.sliding_window > 0
+            && config
+                .layer_types
+                .iter()
+                .any(|t| matches!(t, atlas_core::config::LayerType::SlidingAttention))
+            && config
+                .layer_types
+                .iter()
+                .any(|t| matches!(t, atlas_core::config::LayerType::FullAttention));
+        let sliding_meta = if has_hybrid_sliding {
+            let tables = bt_rows * max_blocks * 4;
+            256 + ((tables + 63) & !63) + m * 8
+        } else {
+            0
+        };
+
         const FLA_CHUNK: usize = 64;
         let gdn_fla_scratch = if config.linear_num_value_heads > 0
             && config.linear_key_head_dim == 128
@@ -284,6 +333,7 @@ impl BufferSizes {
             expert_down_out,
             splitk_workspace,
             gdn_fla_scratch,
+            sliding_meta,
         }
     }
 
@@ -308,5 +358,6 @@ impl BufferSizes {
             + self.expert_down_out
             + self.splitk_workspace
             + self.gdn_fla_scratch
+            + self.sliding_meta
     }
 }

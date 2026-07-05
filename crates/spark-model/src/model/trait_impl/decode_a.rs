@@ -118,6 +118,36 @@ impl TransformerModel {
         self.gpu
             .copy_h2d_async(bt_bytes, meta_base.offset(256), stream)?;
 
+        // Sliding split pool: upload the ring twin (slot + ring-expanded
+        // table, row 0 of the dedicated staging buffer — stable addresses,
+        // so CUDA-graph replays read the fresh values each step exactly
+        // like the full-pool metadata above).
+        let ring_len = self.sliding_ring_len();
+        // STEP37-QUALITY Round 7: assert the live read window for this decode
+        // step is alias-free in the ring (no-op unless ATLAS_SLIDING_KV_VERIFY=1).
+        if ring_len > 0 {
+            let win = self.config.sliding_window as usize;
+            let hi = seq.seq_len + 1;
+            self.verify_sliding_no_alias(seq, hi.saturating_sub(win), hi, bs, ring_len)?;
+        }
+        let (sliding_slot, sliding_block_table) = if ring_len > 0 {
+            self.upload_sliding_decode_row(
+                seq,
+                bs,
+                0,
+                seq.seq_len,
+                seq.block_table.len(),
+                seq.block_table.len().max(1),
+                stream,
+            )?;
+            (
+                self.sliding_decode_slots_base(),
+                self.sliding_decode_tables_base(),
+            )
+        } else {
+            (DevicePtr(0), DevicePtr(0))
+        };
+
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
             positions_h: meta_base,
@@ -127,6 +157,8 @@ impl TransformerModel {
             block_table: meta_base.offset(256),
             max_blocks_per_seq: max_blocks,
             num_seqs: 1,
+            sliding_slot,
+            sliding_block_table,
         };
 
         // CUDA graphs cannot capture NCCL all-reduce (it runs on a separate

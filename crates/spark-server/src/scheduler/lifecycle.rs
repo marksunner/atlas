@@ -9,7 +9,9 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq) {
     let last_tok = a.output_tokens.last().copied();
     let is_eos = last_tok.is_some_and(|t| a.eos_tokens.contains(&t));
     let is_tool_call_end = last_tok == a.tool_call_end_token;
-    let reason = if is_eos {
+    let reason = if a.forced_close_activated {
+        "length"
+    } else if is_eos {
         "stop"
     } else if is_tool_call_end {
         "tool_calls"
@@ -225,6 +227,7 @@ pub fn swap_out_sequence(
         timeout_at: a.timeout_at,
         swap_id,
         cached_prompt_tokens: a.cached_prompt_tokens,
+        forced_close_activated: a.forced_close_activated,
     })
 }
 
@@ -318,6 +321,7 @@ pub fn resume_swapped_seq(
         tool_call_end_token: s.tool_call_end_token,
         // Grammar state is not serializable; resumed sequences use legacy fallback.
         grammar_state: None,
+        forced_close_activated: s.forced_close_activated,
         pending_drafts: Vec::new(),
         last_token_time: Instant::now(),
         request_start: s.request_start,

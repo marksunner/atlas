@@ -112,6 +112,11 @@ impl TransformerModel {
         self.gpu
             .copy_h2d_async(&bt_bytes, meta_base.offset(768), stream)?;
 
+        // Sliding split pool: batched ring twin (same row stride as the
+        // full-pool table so kernels index both identically).
+        let (sliding_slot, sliding_block_table) =
+            self.upload_sliding_batch(seqs, padded_n, max_blocks as usize, block_size, stream)?;
+
         Ok(AttnMetadataDev {
             positions: meta_base,
             positions_h: meta_base,
@@ -121,6 +126,8 @@ impl TransformerModel {
             block_table: meta_base.offset(768),
             max_blocks_per_seq: max_blocks,
             num_seqs: padded_n as u32,
+            sliding_slot,
+            sliding_block_table,
         })
     }
 
@@ -196,6 +203,13 @@ impl TransformerModel {
         self.gpu
             .copy_h2d_async(&bt_bytes, meta_base.offset(768), stream)?;
 
+        // Sliding split pool: batched ring twin. The staging region is
+        // distinct from the caller's `meta_base` (mixed_forward places
+        // decode metadata inside scratch; sliding staging has its own
+        // dedicated buffer), so the two never collide.
+        let (sliding_slot, sliding_block_table) =
+            self.upload_sliding_batch(seqs, padded_n, max_blocks as usize, block_size, stream)?;
+
         Ok(AttnMetadataDev {
             positions: meta_base,
             positions_h: meta_base,
@@ -205,36 +219,9 @@ impl TransformerModel {
             block_table: meta_base.offset(768),
             max_blocks_per_seq: max_blocks,
             num_seqs: padded_n as u32,
+            sliding_slot,
+            sliding_block_table,
         })
-    }
-
-    /// Read back first `n` BF16 values from device and return as f32 + L2 norm.
-    pub(super) fn readback_bf16(&self, ptr: DevicePtr, n: usize) -> Result<(Vec<f32>, f32)> {
-        let bytes = n * 2;
-        let mut buf = vec![0u8; bytes];
-        self.gpu.copy_d2h(ptr, &mut buf)?;
-        let vals: Vec<f32> = buf
-            .chunks_exact(2)
-            .map(|c| {
-                let bits = u16::from_le_bytes([c[0], c[1]]);
-                f32::from_bits((bits as u32) << 16)
-            })
-            .collect();
-        let norm = vals.iter().map(|v| v * v).sum::<f32>().sqrt();
-        Ok((vals, norm))
-    }
-
-    /// Read FP32 values from GPU memory (for FP32 residual stream diagnostics).
-    pub(super) fn readback_f32(&self, ptr: DevicePtr, n: usize) -> Result<(Vec<f32>, f32)> {
-        let bytes = n * 4;
-        let mut buf = vec![0u8; bytes];
-        self.gpu.copy_d2h(ptr, &mut buf)?;
-        let vals: Vec<f32> = buf
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        let norm = vals.iter().map(|v| v * v).sum::<f32>().sqrt();
-        Ok((vals, norm))
     }
 
     /// Profile mode: run each layer with sync+timing, no CUDA graph.
@@ -434,6 +421,26 @@ impl TransformerModel {
         self.gpu
             .copy_h2d_async(bt_bytes, meta_base.offset(256), stream)?;
 
+        // Sliding split pool: ring twin (row 0), mirrors decode_dispatch.
+        let ring_len = self.sliding_ring_len();
+        let (sliding_slot, sliding_block_table) = if ring_len > 0 {
+            self.upload_sliding_decode_row(
+                seq,
+                bs,
+                0,
+                seq.seq_len,
+                seq.block_table.len(),
+                seq.block_table.len().max(1),
+                stream,
+            )?;
+            (
+                self.sliding_decode_slots_base(),
+                self.sliding_decode_tables_base(),
+            )
+        } else {
+            (DevicePtr(0), DevicePtr(0))
+        };
+
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
             positions_h: meta_base,
@@ -443,6 +450,8 @@ impl TransformerModel {
             block_table: meta_base.offset(256),
             max_blocks_per_seq: max_blocks,
             num_seqs: 1,
+            sliding_slot,
+            sliding_block_table,
         };
 
         let ctx = ForwardContext {

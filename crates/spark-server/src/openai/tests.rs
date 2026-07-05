@@ -283,7 +283,127 @@ fn server_default_merged_when_request_silent() {
 
     let (enabled, budget) = req.resolve_thinking(false);
     assert!(enabled);
-    assert!(budget.is_some());
+    // Issue #193: enabling thinking via chat_template_kwargs WITHOUT an
+    // explicit `thinking_budget` must defer to the per-model
+    // `max_thinking_budget` (signalled by `None`), NOT cap at the
+    // conservative DEFAULT_THINKING_BUDGET. Capping forced `</think>`
+    // mid-sentence (~268 tokens + role-marker leak).
+    assert!(budget.is_none());
+}
+
+/// Issue #193 regression: `chat_template_kwargs.enable_thinking=true`
+/// (no explicit budget) must resolve to the SAME `(enable, budget)` pair
+/// as the legacy `enable_thinking=true` flag — both `(true, None)` —
+/// so neither path hits the 256-token mid-sentence cut.
+#[test]
+fn chat_template_kwargs_enable_thinking_matches_legacy_path() {
+    let via_kwargs: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "chat_template_kwargs": {"enable_thinking": true},
+    }))
+    .expect("valid chat request");
+
+    let via_legacy: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "enable_thinking": true,
+    }))
+    .expect("valid chat request");
+
+    assert_eq!(via_kwargs.resolve_thinking(false), (true, None));
+    assert_eq!(
+        via_kwargs.resolve_thinking(false),
+        via_legacy.resolve_thinking(false),
+        "chat_template_kwargs and legacy enable_thinking must resolve identically",
+    );
+}
+
+/// An explicit `thinking_budget` inside chat_template_kwargs is still
+/// honored verbatim — the #193 fix only changes the no-budget case.
+#[test]
+fn chat_template_kwargs_explicit_budget_preserved() {
+    let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "chat_template_kwargs": {"enable_thinking": true, "thinking_budget": 1024},
+    }))
+    .expect("valid chat request");
+    assert_eq!(req.resolve_thinking(false), (true, Some(1024)));
+}
+
+#[test]
+fn chat_template_kwargs_enable_thinking_false_hard_off() {
+    let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "chat_template_kwargs": {"enable_thinking": false},
+    }))
+    .expect("valid chat request");
+    assert_eq!(req.resolve_thinking(true), (false, Some(0)));
+}
+
+#[test]
+fn chat_template_kwargs_thinking_budget_zero_hard_off() {
+    let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "chat_template_kwargs": {"thinking_budget": 0},
+    }))
+    .expect("valid chat request");
+    assert_eq!(req.resolve_thinking(true), (false, Some(0)));
+}
+
+/// Issue #193 edge case: explicit `enable_thinking: false` via
+/// chat_template_kwargs must still hard-disable thinking and pin the
+/// budget to 0 — the fix only touched the `true`-no-budget branch. The
+/// `Some(0)` is deliberate: it signals an explicit opt-out distinct from
+/// the `None` "defer to model" signal, and it must win even when the
+/// MODEL.toml default (`model_default=true`) would otherwise enable
+/// thinking.
+#[test]
+fn chat_template_kwargs_disable_thinking_pins_budget_zero() {
+    let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "chat_template_kwargs": {"enable_thinking": false},
+    }))
+    .expect("valid chat request");
+    // Disabled regardless of the model default.
+    assert_eq!(req.resolve_thinking(false), (false, Some(0)));
+    assert_eq!(req.resolve_thinking(true), (false, Some(0)));
+}
+
+/// Issue #193 edge case: `chat_template_kwargs` present but carrying
+/// NEITHER `enable_thinking` NOR `thinking_budget` must fall straight
+/// through channel 4 to the MODEL.toml model default (channel 6) — the
+/// empty kwargs object is not itself a thinking signal.
+#[test]
+fn chat_template_kwargs_empty_falls_through_to_model_default() {
+    let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "chat_template_kwargs": {},
+    }))
+    .expect("valid chat request");
+    // Silent kwargs → inherit the per-model default, both directions,
+    // with `None` so thinking.rs defers to `max_thinking_budget`.
+    assert_eq!(req.resolve_thinking(false), (false, None));
+    assert_eq!(req.resolve_thinking(true), (true, None));
+}
+
+/// Issue #193 edge case: an explicit `thinking_budget: 0` (with thinking
+/// nominally enabled) resolves to a hard-off `(false, Some(0))` — the
+/// `budget > 0` guard makes zero mean "off", matching the disable path.
+#[test]
+fn chat_template_kwargs_zero_budget_is_disabled() {
+    let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "chat_template_kwargs": {"enable_thinking": true, "thinking_budget": 0},
+    }))
+    .expect("valid chat request");
+    assert_eq!(req.resolve_thinking(false), (false, Some(0)));
 }
 
 #[test]

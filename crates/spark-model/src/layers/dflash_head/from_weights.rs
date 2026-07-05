@@ -75,6 +75,9 @@ impl BlockDiffusionDraftHead {
             layer_dtypes: vec![],
             layer_dims: vec![],
             cache_blocks_per_seq: None,
+            layer_sliding: Vec::new(),
+            num_sliding_blocks: 0,
+            sliding_ring_blocks: 0,
         };
         let num_blocks = (max_seq_len + gamma_val + 1) / block_size + 1;
         let kv_cache = PagedKvCache::new(kv_config, num_blocks, gpu)?;

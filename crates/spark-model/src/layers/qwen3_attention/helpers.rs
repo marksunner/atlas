@@ -48,6 +48,14 @@ impl Qwen3AttentionLayer {
         self.rotary_dim_override = Some(rotary_dim);
     }
 
+    /// Attach a precomputed llama3 (NTK-by-parts) inv_freq table for this
+    /// layer. When set, the standard (non-MLA) RoPE dispatch routes through
+    /// the table-based `rope_forward_yarn` kernel. The table must be
+    /// `[rotary_dim/2]` FP32 on GPU, matching the layer's `rotary_dim`.
+    pub fn set_rope_inv_freq_table(&mut self, table: spark_runtime::gpu::DevicePtr) {
+        self.rope_inv_freq_table = table;
+    }
+
     /// Enable proportional RoPE (Gemma-4 full-attention layers). Must be
     /// called AFTER `set_rope_overrides`; the `rotary_dim` set there is
     /// reinterpreted as the number of non-zero rotation pairs.
@@ -149,5 +157,39 @@ impl Qwen3AttentionLayer {
     pub(crate) fn effective_attn_scale(&self, head_dim: u32) -> f32 {
         self.attn_scale_override
             .unwrap_or_else(|| 1.0f32 / (head_dim as f32).sqrt())
+    }
+
+    /// Resolve the metadata THIS layer must use under the sliding-window
+    /// split KV pool: sliding layers get the ring twin (`sliding_slot` /
+    /// `sliding_block_table`, block IDs in the sliding ID space), all
+    /// other layers — and every layer when the split pool is off — keep
+    /// the full-pool pointers unchanged.
+    ///
+    /// A NULL `sliding_slot` on a split-pool sliding layer means the
+    /// calling forward path never staged the twin (wiring bug): fail
+    /// loudly HERE, because writing a full-pool slot through a sliding
+    /// layer's small pool is an out-of-bounds GPU write that would
+    /// surface hundreds of launches later as a sticky CUDA 700.
+    /// `sliding_block_table` MAY be NULL on paths where the full-pool
+    /// table is NULL too (chunk-0 contiguous attention reads no table).
+    pub(crate) fn meta_for_layer(
+        &self,
+        meta: &crate::layer::AttnMetadataDev,
+        kv_cache: &spark_runtime::kv_cache::PagedKvCache,
+    ) -> anyhow::Result<crate::layer::AttnMetadataDev> {
+        if self.sliding_window.is_none() || !kv_cache.config().split_sliding_active() {
+            return Ok(*meta);
+        }
+        anyhow::ensure!(
+            meta.sliding_slot.0 != 0,
+            "layer {}: sliding split pool active but this forward path staged no \
+             sliding slot metadata — unwired path (see sliding_meta.rs)",
+            self.attn_layer_idx,
+        );
+        Ok(crate::layer::AttnMetadataDev {
+            slot: meta.sliding_slot,
+            block_table: meta.sliding_block_table,
+            ..*meta
+        })
     }
 }

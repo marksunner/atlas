@@ -234,6 +234,18 @@ impl InferenceRequest {
         }
     }
 
+    /// Whether this turn has tools available (any `tool_choice`, including
+    /// `"auto"`). The sticky "this is a tool turn" signal — used to set
+    /// `ActiveSeq::tool_request` even when the tool-call grammar is disabled
+    /// (`[behavior].disable_tool_grammar=true`) and `tool_choice="auto"`, the
+    /// case where both `require_tool_call` and `grammar_spec` are absent.
+    pub fn tools_active(&self) -> bool {
+        match self {
+            InferenceRequest::Blocking { tools_active, .. } => *tools_active,
+            InferenceRequest::Streaming { tools_active, .. } => *tools_active,
+        }
+    }
+
     /// Whether `<tool_call>` should be suppressed (loop detected).
     pub fn suppress_tool_call(&self) -> bool {
         match self {
@@ -323,20 +335,45 @@ pub(crate) fn tokenize_stop_sequences(
     tokens
 }
 
-/// Strip any matching stop sequence from the end of the output text.
-/// Per OpenAI spec, returned text must not contain the stop sequence.
+/// Truncate `text` at the first occurrence of any stop sequence.
+///
+/// Per the OpenAI spec, when a `stop` string appears the returned text must be
+/// cut at the stop sequence — the stop string itself AND everything after it are
+/// removed — regardless of where in the text the stop string lands.
+///
+/// Issue #100: the previous implementation used `strip_suffix`, i.e. it only
+/// removed a stop string that happened to be the *trailing* suffix of the
+/// output. A stop string appearing mid-text was silently ignored. This made
+/// user-supplied `stop: ["\nuser", "\nassistant", "<|im_end|>"]` a no-op against
+/// the role-marker / prompt-echo run-on: the requested substrings appeared
+/// verbatim in `content` (reporter observation #1) because they were never at
+/// the very end. We now truncate at the earliest match of any stop string,
+/// mirroring the streaming path's `apply_stop_string_holdback`
+/// (`chat_stream/handle_token.rs`), which already truncates at `find`.
+///
+/// Empty stop strings are skipped — `"".find` matches at position 0 and would
+/// otherwise erase the entire response (the old `strip_suffix("")` was a no-op,
+/// so empty stops must stay harmless).
+///
+/// #100 Finding 5 (acknowledged limitation, out of scope): this is a POST-HOC
+/// text truncation only — generation does not actually halt early at a
+/// multi-token stop string (e.g. `"\nuser"`, which the tokenizer may split
+/// across several tokens). The scheduler stops early only on single stop TOKENS
+/// (`eos_tokens`, incl. the force-added `<|im_end|>`; see `is_eos_stop`). So for
+/// a multi-token stop string the model runs to a token-level stop (or
+/// `max_tokens`) and this function then trims the text — the content is clean
+/// but `finish_reason` may be `"length"` rather than `"stop"`. Making a
+/// multi-token stop string halt decoding would require detokenized-suffix
+/// matching in the decode loop (scheduler-level change) and is deliberately not
+/// attempted here.
 pub(crate) fn strip_stop_sequences(mut text: String, stops: &[String]) -> String {
-    // Try longest-first so overlapping prefixes (`["</answer", "</answer>"]`)
-    // don't truncate at the shorter (wrong) match boundary. strip_suffix
-    // is end-anchored, so usually only one of the two end-matches at a
-    // time, but defensive ordering handles the cases where it doesn't.
-    let mut sorted: Vec<&String> = stops.iter().collect();
-    sorted.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    for s in sorted {
-        if let Some(stripped) = text.strip_suffix(s.as_str()) {
-            text.truncate(stripped.len());
-            break;
-        }
+    let earliest = stops
+        .iter()
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| text.find(s.as_str()))
+        .min();
+    if let Some(pos) = earliest {
+        text.truncate(pos);
     }
     text
 }
@@ -364,5 +401,142 @@ pub(crate) fn extract_thinking(
         p.extract_thinking(text, enable_thinking)
     } else {
         (None, text.to_string())
+    }
+}
+
+#[cfg(test)]
+mod strip_stop_sequences_tests {
+    //! Issue #100: `strip_stop_sequences` must truncate at the FIRST occurrence
+    //! of any stop string anywhere in the text — not only when the stop string
+    //! is a trailing suffix. The pre-fix `strip_suffix` logic ignored mid-text
+    //! stop strings, so `stop: ["\nuser", ...]` was a no-op against the
+    //! role-marker / prompt-echo run-on.
+    use super::strip_stop_sequences;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn truncates_at_midtext_stop_string() {
+        // The exact #100 run-on shape: a real answer followed by ChatML role
+        // markers + a prompt echo. With `stop: ["\nuser"]` the output must be
+        // cut at the first "\nuser".
+        let out = strip_stop_sequences(
+            "Hallo!\nuser\nSag in einem Satz hallo.\nassistant\nHallo!".to_string(),
+            &s(&["\nuser", "\nassistant"]),
+        );
+        assert_eq!(out, "Hallo!");
+    }
+
+    #[test]
+    fn picks_earliest_of_multiple_stops() {
+        // "\nassistant" occurs later than "\nuser"; truncate at the earliest.
+        let out = strip_stop_sequences(
+            "answer\nassistant before\nuser after".to_string(),
+            &s(&["\nuser", "\nassistant"]),
+        );
+        assert_eq!(out, "answer");
+    }
+
+    #[test]
+    fn still_strips_trailing_suffix() {
+        // Backwards-compatible with the old suffix behavior.
+        let out = strip_stop_sequences("done<|im_end|>".to_string(), &s(&["<|im_end|>"]));
+        assert_eq!(out, "done");
+    }
+
+    #[test]
+    fn no_match_is_unchanged() {
+        let out = strip_stop_sequences("clean output".to_string(), &s(&["\nuser"]));
+        assert_eq!(out, "clean output");
+    }
+
+    #[test]
+    fn empty_stops_list_is_unchanged() {
+        let out = strip_stop_sequences("clean output".to_string(), &[]);
+        assert_eq!(out, "clean output");
+    }
+
+    #[test]
+    fn empty_stop_string_does_not_erase_text() {
+        // An empty stop string must NOT truncate at position 0 (regression
+        // guard: the old `strip_suffix("")` was a no-op).
+        let out = strip_stop_sequences("keep me".to_string(), &s(&[""]));
+        assert_eq!(out, "keep me");
+    }
+
+    #[test]
+    fn truncation_respects_utf8_boundaries() {
+        // The stop string lands right after multi-byte content; truncating at
+        // the byte offset returned by `find` is always char-aligned because
+        // `find` returns the start byte of the match.
+        let out = strip_stop_sequences("Grüße\nuserX".to_string(), &s(&["\nuser"]));
+        assert_eq!(out, "Grüße");
+    }
+
+    #[test]
+    fn truncates_at_eos_marker_strings() {
+        // Basic EOS-as-stop-string: the ChatML end-of-turn marker and the
+        // fallback EOS text are cut wherever they appear. Mirrors the
+        // token-level stop for models/clients that surface them as text.
+        let out = strip_stop_sequences(
+            "answer<|im_end|>\n<|im_start|>user".to_string(),
+            &s(&["<|im_end|>", "<|endoftext|>"]),
+        );
+        assert_eq!(out, "answer");
+    }
+
+    #[test]
+    fn overlapping_prefix_stops_truncate_at_shared_offset() {
+        // Overlapping prefixes (`</answer` vs `</answer>`): both start at the
+        // same offset, so truncating at the earliest `find` position yields the
+        // identical result no matter which one the `min` tie picks. (The old
+        // suffix logic needed longest-first sorting to get this right; the
+        // first-occurrence rule is order-independent.)
+        let out = strip_stop_sequences(
+            "text</answer>tail".to_string(),
+            &s(&["</answer>", "</answer"]),
+        );
+        assert_eq!(out, "text");
+    }
+
+    #[test]
+    fn truncates_at_multibyte_cjk_stop_string() {
+        // A fully multi-byte (3-bytes-per-char) stop string truncates cleanly
+        // on a char boundary — no reliance on the stop or the prefix being ASCII.
+        let out = strip_stop_sequences("結果です。終了ここから先".to_string(), &s(&["終了"]));
+        assert_eq!(out, "結果です。");
+    }
+
+    /// #100 Finding 3: `/v1/completions` must strip hidden reasoning BEFORE
+    /// applying user stop sequences. This test pins the operation ORDER used in
+    /// `completions.rs`: a stop string that also appears inside
+    /// `<think>...</think>` must NOT truncate the visible answer.
+    ///
+    /// Correct order (thinking-first): the reasoning — including its own
+    /// `\nuser` — is removed, leaving `"The answer is 42."`; the stop then finds
+    /// no match and the answer survives.
+    ///
+    /// Buggy order (stops-first, pre-fix): the raw text `find("\nuser")` hits
+    /// inside the reasoning at an early offset, truncating there and dropping the
+    /// real answer entirely — the regression this reorder prevents.
+    #[test]
+    fn completions_strips_thinking_before_stops() {
+        use crate::api::strip::strip_thinking_tags;
+        let raw = "<think>Consider the\nuser question carefully.</think>The answer is 42.";
+        let stops = s(&["\nuser"]);
+
+        // Correct order (as shipped in completions.rs after the fix).
+        let thinking_first = strip_stop_sequences(strip_thinking_tags(raw), &stops);
+        assert_eq!(thinking_first, "The answer is 42.");
+
+        // Buggy order truncates inside the hidden reasoning — asserted here so a
+        // future refactor that reintroduces it is caught.
+        let stops_first = strip_thinking_tags(&strip_stop_sequences(raw.to_string(), &stops));
+        assert_ne!(
+            stops_first, "The answer is 42.",
+            "stops-before-thinking must lose the answer (regression guard)"
+        );
     }
 }

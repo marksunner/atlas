@@ -190,6 +190,34 @@ impl TransformerModel {
         kv_cache.zero_block(dummy_kv_block, gpu.as_ref(), gpu.default_stream())?;
         gpu.synchronize(gpu.default_stream())?;
 
+        // Sliding split pool: reserve a zeroed dummy block in the SLIDING
+        // ID space (full-pool IDs are out of range there) for OOB-safe
+        // padding of sliding block tables, and force prefix caching off —
+        // ring slots are overwritten in place as the window advances, so
+        // radix-tree entries referencing them would silently go stale.
+        let split_sliding = kv_cache.config().split_sliding_active();
+        let sliding_split_ring = kv_cache.sliding_ring_blocks();
+        let dummy_sliding_block = if split_sliding {
+            let b = kv_cache.alloc_sliding_block()?;
+            kv_cache.zero_sliding_block(b, gpu.as_ref(), gpu.default_stream())?;
+            gpu.synchronize(gpu.default_stream())?;
+            b
+        } else {
+            0
+        };
+        let prefix_cache: Box<dyn spark_runtime::prefix_cache::PrefixCache> =
+            if split_sliding && prefix_cache.is_active() {
+                tracing::warn!(
+                    "--enable-prefix-caching disabled: the sliding-window KV split pool \
+                     overwrites sliding-layer ring blocks in place, which is incompatible \
+                     with radix-tree block reuse. Full-attention memory savings from the \
+                     split pool far outweigh prefix reuse for long contexts."
+                );
+                Box::new(spark_runtime::prefix_cache::NoPrefixCaching)
+            } else {
+                prefix_cache
+            };
+
         // Build MTP proposer (extracted to keep `new` under the file cap).
         let proposer: Option<Arc<dyn DraftProposer>> = super::impl_a1_init::build_mtp_proposer(
             use_speculative,
@@ -450,6 +478,8 @@ impl TransformerModel {
             ssm_snapshots,
             max_blocks_per_seq,
             dummy_kv_block,
+            dummy_sliding_block,
+            sliding_split_ring,
             profile,
             profile_first_pending: std::sync::atomic::AtomicBool::new(profile_first),
             proposer,

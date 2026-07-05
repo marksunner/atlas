@@ -35,6 +35,7 @@ pub struct GrammarState {
     /// Bitmask buffer: `Box<[i32]>` of shape `(1, ceil(vocab_size / 32))`.
     bitmask_data: Box<[i32]>,
     vocab_size: usize,
+    decoded_vocab: Box<[Box<[u8]>]>,
     /// Model stop/EOS token IDs (e.g. `<|im_end|>`). These are control
     /// tokens that terminate generation, NOT part of the grammar's content
     /// language — [`Self::accept_token`] accepts them unconditionally rather
@@ -78,10 +79,19 @@ impl GrammarState {
 
         let bitmask_data = allocate_token_bitmask(1, vocab_size);
 
+        let decoded_vocab = compiled
+            .tokenizer_info()
+            .decoded_vocab()
+            .iter()
+            .map(|b| b.clone().into_boxed_slice())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
         Ok(Self {
             matcher,
             bitmask_data,
             vocab_size,
+            decoded_vocab,
             stop_tokens: Box::new([]),
         })
     }
@@ -172,6 +182,10 @@ impl GrammarState {
         // unconditionally and let the EOS handler terminate. This cannot
         // corrupt tool-call STRUCTURE — only non-stop tokens drive the matcher.
         if self.stop_tokens.contains(&token_id) {
+            self.fill_bitmask();
+            if self.is_token_allowed(token_id) {
+                return self.matcher.accept_token(token_id as i32);
+            }
             return true;
         }
         self.matcher.accept_token(token_id as i32)
@@ -205,6 +219,40 @@ impl GrammarState {
         self.matcher.forced_token()
     }
 
+    /// Pick a grammar-legal token for budget-forced graceful close.
+    ///
+    /// The priority is deliberately structural and deterministic: closing
+    /// quote, then closing bracket, then closing brace, then the lowest legal
+    /// token. `None` means the grammar has no legal continuation in the current
+    /// state; callers must fall back to the normal path rather than panic.
+    pub fn forced_close_token(&mut self) -> Option<u32> {
+        if self.matcher.is_terminated() {
+            return None;
+        }
+        self.fill_bitmask();
+
+        let mut best: Option<(usize, usize, u32)> = None;
+        for token_id in 0..self.vocab_size as u32 {
+            if !self.is_token_allowed(token_id) {
+                continue;
+            }
+            let Some(bytes) = self.decoded_vocab.get(token_id as usize) else {
+                continue;
+            };
+            let rank = if self.stop_tokens.contains(&token_id) {
+                3
+            } else {
+                forced_close_rank(bytes)
+            };
+            let len_score = usize::MAX.saturating_sub(bytes.len());
+            let score = (rank, len_score, token_id);
+            if best.is_none_or(|b| score < b) {
+                best = Some(score);
+            }
+        }
+        best.map(|(_, _, token_id)| token_id)
+    }
+
     /// Whether the grammar has been fully matched (all required structure generated).
     pub fn is_terminated(&self) -> bool {
         self.matcher.is_terminated()
@@ -212,12 +260,14 @@ impl GrammarState {
 
     /// Number of actual matcher history steps (== tokens `rollback` can undo).
     ///
-    /// BUG#3 (2026-06-02): `accept_token` returns `true` for stop/EOS tokens and
-    /// in the terminated state WITHOUT advancing the matcher (no history step).
-    /// Spec/verify rollback accounting must therefore count actual advances via
-    /// the delta of this value across a draft span — NOT the number of
-    /// `accept_token`→true calls — or it over-rewinds (corrupt state / rollback
-    /// panic) when a stop or terminated token lands inside the span.
+    /// BUG#3 (2026-06-02): `accept_token` returns `true` for legal stop/EOS
+    /// tokens by feeding them to the matcher, but illegal mid-structure
+    /// stop/EOS tokens and tokens in the terminated state bypass the matcher
+    /// (no history step). Spec/verify rollback accounting must therefore count
+    /// actual advances via the delta of this value across a draft span — NOT
+    /// the number of `accept_token`→true calls — or it over-rewinds (corrupt
+    /// state / rollback panic) when a non-advancing stop or terminated token
+    /// lands inside the span.
     pub fn num_history_steps(&self) -> usize {
         self.matcher.num_history_steps()
     }
@@ -249,6 +299,19 @@ impl GrammarState {
                 logits[token_id] = f32::NEG_INFINITY;
             }
         }
+    }
+}
+
+fn forced_close_rank(bytes: &[u8]) -> usize {
+    let first = bytes
+        .iter()
+        .copied()
+        .find(|b| !matches!(b, b' ' | b'\n' | b'\r' | b'\t'));
+    match first {
+        Some(b'"') => 0,
+        Some(b']') => 1,
+        Some(b'}') => 2,
+        _ => 4,
     }
 }
 

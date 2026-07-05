@@ -75,6 +75,10 @@ pub(super) struct PrefillInProgress {
     /// hard-coded 512-token fallback.
     pub spontaneous_think_budget: u32,
     pub require_tool_call: bool,
+    /// Whether this turn has tools available (any `tool_choice`). Carries the
+    /// request-level signal to the deferred-promotion path so `tool_request`
+    /// can be set even when the tool-call grammar is disabled.
+    pub tools_active: bool,
     pub suppress_tool_call: bool,
     /// F60 (2026-04-27): MTP-disable flag (propagated to ActiveSeq).
     pub disable_mtp: bool,
@@ -244,6 +248,10 @@ pub(super) struct ActiveSeq {
     pub ssm_rollback_ring: super::ssm_decode_ring::SsmDecodeRing,
     /// Grammar state for constrained decoding (tool_choice="required").
     pub grammar_state: Option<GrammarState>,
+    /// Sticky once budget-aware grammar forced-close mode activates. The
+    /// response may finish via a grammar boundary, but the API finish reason is
+    /// still `length` because the token budget forced truncation.
+    pub forced_close_activated: bool,
     /// MTP draft tokens awaiting verification.
     pub pending_drafts: Vec<u32>,
     /// Timestamp of the last token emission (for TBT deadline tracking).
@@ -372,6 +380,7 @@ pub(super) struct SwappedSeq {
     pub logprobs_data: Vec<crate::api::TokenLogprobs>,
     /// Number of prompt tokens served by the prefix cache (no prefill cost).
     pub cached_prompt_tokens: u32,
+    pub forced_close_activated: bool,
     pub timeout_at: Option<Instant>,
     pub swap_id: u64,
 }
@@ -397,5 +406,23 @@ mod budget_tests {
         let mut r = 0usize;
         assert!(!consume_budget(&mut r));
         assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn consume_budget_stops_exactly_at_max_tokens_boundary() {
+        // Issue #100 contract: stop at the EXACT max_tokens boundary. With one
+        // token of budget left, the final allowed token is emitted (remaining
+        // 1 → 0, sequence still alive), and the NEXT consumption reports finish
+        // without wrapping — the length stop fires precisely at the boundary,
+        // never one token over. (This is the SSOT both decode paths call:
+        // `emit_token` and `handle_content_token` via `consume_generation_budget`.)
+        let mut r = 1usize; // exactly one token of generation budget remaining
+        assert!(consume_budget(&mut r), "the last budgeted token is emitted");
+        assert_eq!(r, 0, "budget now exhausted at the boundary");
+        assert!(
+            !consume_budget(&mut r),
+            "the token past max_tokens must finish, not generate"
+        );
+        assert_eq!(r, 0, "never wraps past the boundary");
     }
 }

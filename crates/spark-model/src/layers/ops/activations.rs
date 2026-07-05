@@ -36,6 +36,35 @@ pub fn silu_mul(
         .launch(stream)
 }
 
+/// SwiGLU pre-activation clamp (Step 3.7 `swiglu_limits` / vLLM
+/// `SwigluStepAndMul`). Clamps the gate/up GEMM outputs in place before a
+/// fused silu*up kernel: gate is capped at the pre-silu threshold x*
+/// (silu(x*) = limit, exact by monotonicity), up is clamped to
+/// [-up_limit, up_limit].
+///
+/// Kernel: `swiglu_clamp_bf16(gate, up, gate_max, up_limit, n)`
+/// Grid: (ceil(n/256), 1, 1)  Block: (256, 1, 1)
+pub fn swiglu_clamp(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate: DevicePtr,
+    up: DevicePtr,
+    gate_max: f32,
+    up_limit: f32,
+    num_elements: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(num_elements, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate)
+        .arg_ptr(up)
+        .arg_f32(gate_max)
+        .arg_f32(up_limit)
+        .arg_u32(num_elements)
+        .launch(stream)
+}
+
 /// L2 normalization (in-place): `data[i] = data[i] / sqrt(sum(data^2) + eps)`.
 ///
 /// Applied per head: data is [num_heads, head_dim], each head normalized independently.

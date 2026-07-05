@@ -183,7 +183,7 @@ pub fn build_model(
     } else {
         (config.num_key_value_heads, config.head_dim)
     };
-    let kv_config = KvCacheConfig {
+    let mut kv_config = KvCacheConfig {
         block_size: kv_block_size,
         num_kv_heads: kv_num_heads,
         head_dim: kv_head_dim,
@@ -192,7 +192,96 @@ pub fn build_model(
         layer_dtypes: layer_dtypes.clone(),
         layer_dims: config.kv_layer_dims.clone(),
         cache_blocks_per_seq: hss_cache_blocks_per_seq,
+        layer_sliding: Vec::new(),
+        num_sliding_blocks: 0,
+        sliding_ring_blocks: 0,
     };
+
+    // ── Sliding-window split KV pool (Step 3.7 / Gemma-4 hybrid attention) ──
+    //
+    // Hybrid models waste enormous KV memory when every layer is allocated
+    // `max_seq_len` worth of blocks: Step 3.7's 33 sliding layers
+    // (window=512) only ever attend to the last 512 positions. The split
+    // pool gives sliding layers their own small block-ID space and a
+    // per-sequence RING of R blocks; logical block `i` maps to
+    // `ring[i % R]`. Correctness of the ring size: the KV-write for a
+    // forward pass of M tokens lands BEFORE that pass's paged-attention
+    // reads, so every position in `(chunk_start − window, chunk_end]`
+    // must be alias-free simultaneously → R×block_size ≥ M_max + window,
+    // with M_max = max_batch_tokens (the arena bound on any single pass).
+    // Two positions p < p' collide iff p' − p is a multiple of R×bs; with
+    // that bound, at most one of them is ever in the live span, and the
+    // per-(slot, offset) overwrite retires positions exactly as they
+    // fall out of every sliding layer's window.
+    let sliding_flags = config.attention_layer_sliding_flags();
+    let n_sliding = sliding_flags.iter().filter(|s| **s).count();
+    let n_full_attn = sliding_flags.len() - n_sliding;
+    // STEP37-QUALITY Round 6 reported the split pool's per-sequence ring
+    // intermittently corrupting sliding-layer KV during LONG generation
+    // (~50 % catastrophic repetition at ≥~10 k). Round 7 re-ran that exact
+    // repro on the same dual-Spark EP-2 rig with `ATLAS_SLIDING_KV_SPLIT=1`
+    // and could NOT reproduce it: ~20 requests at 10 k–27.6 k (needle,
+    // creative ×N identical, and a 2 494-token loop-prone enumeration) were
+    // all deterministic (bit-identical MD5 across runs) and loop-free. The
+    // Round-6 catastrophe was almost certainly measured on an interim
+    // pre-fix binary; the ring staging in this tree is correct, and the
+    // size algebra above holds with margin (`R·bs − (M_max+window) ≥ 1`
+    // block; verified at runtime under `ATLAS_SLIDING_KV_VERIFY=1`, which
+    // asserts the live read window is alias-free every step). The split
+    // stays OPT-IN per the Round-7 brief: `ATLAS_SLIDING_KV_SPLIT=1` enables
+    // it (needed for >~18 k context — Hermes 27 k); `ATLAS_NO_SLIDING_KV_SPLIT=1`
+    // still force-disables. Default OFF keeps vLLM-parity KV allocation.
+    let split_opt_in = std::env::var("ATLAS_SLIDING_KV_SPLIT").as_deref() == Ok("1");
+    let split_kill_switch = std::env::var("ATLAS_NO_SLIDING_KV_SPLIT").as_deref() == Ok("1");
+    let spec_requested = use_speculative || self_speculative || dflash_args.is_some();
+    let mut split_sliding = split_opt_in
+        && config.sliding_window > 0
+        && config.kv_lora_rank == 0            // MLA paths are not split-aware
+        && hss_cache_blocks_per_seq.is_none()  // HSS has its own windowing
+        && n_sliding > 0
+        && n_full_attn > 0
+        && !split_kill_switch;
+    if split_sliding && spec_requested {
+        tracing::warn!(
+            "sliding-window KV split pool DISABLED: speculative decoding (MTP/self-spec/\
+             DFlash) verify paths have no sliding metadata twin yet. Drop the speculative \
+             flags to unlock ~{}× less KV memory on the {} sliding layers.",
+            (max_seq_len.div_ceil(kv_block_size))
+                .div_ceil((max_batch_tokens + config.sliding_window as usize).div_ceil(kv_block_size))
+                .max(1),
+            n_sliding,
+        );
+        split_sliding = false;
+    }
+    if split_sliding {
+        // R·bs must exceed the widest live span `M_max + window` so every
+        // simultaneously-live position owns a distinct (ring slot, offset).
+        // `div_ceil` alone already satisfies `R·bs ≥ M_max + window`; the
+        // `+ 1` block buys a full extra block of headroom so the guarantee
+        // is not razor-thin at pathological chunk/offset alignments (costs
+        // one 16-token block per sliding layer — negligible).
+        let ring =
+            (max_batch_tokens + config.sliding_window as usize).div_ceil(kv_block_size) + 1;
+        kv_config.layer_sliding = sliding_flags;
+        kv_config.sliding_ring_blocks = ring;
+        // One ring per concurrent sequence + 1 permanent dummy block
+        // (OOB-safe padding target for sliding block tables).
+        kv_config.num_sliding_blocks = max_batch_size * ring + 1;
+        tracing::info!(
+            "Sliding-window KV split pool: {} sliding layers (window={}) get {} blocks each \
+             (ring {} blocks/seq × {} seqs + dummy) instead of scaling with max_seq_len={}; \
+             {} full-attention layers keep budget-driven sizing. \
+             Prefix caching + speculative decoding are unavailable in this mode \
+             (ATLAS_NO_SLIDING_KV_SPLIT=1 restores the legacy allocator).",
+            n_sliding,
+            config.sliding_window,
+            kv_config.num_sliding_blocks,
+            ring,
+            max_batch_size,
+            max_seq_len,
+            n_full_attn,
+        );
+    }
 
     // Phase 6.2.c — KV-dtype gating for `--high-speed-swap`.
     //

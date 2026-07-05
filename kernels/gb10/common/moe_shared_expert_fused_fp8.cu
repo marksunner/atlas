@@ -318,7 +318,11 @@ extern "C" __global__ void moe_expert_silu_down_shared_fp8(
 
     // Shared memory: E4M3 LUT + precomputed SiLU(gate)*up activation.
     __shared__ float s_lut[256];
-    __shared__ float s_act[1024]; // max K=1024 (actual K=512)
+    // Dynamic shared memory: s_act[K] = SiLU(gate)*up. The old static
+    // s_act[1024] overflowed for expert inter dims > 1024 (Step 3.7
+    // Flash: K=1280) — same fix as the NVFP4 fused kernels. Launch
+    // wrapper passes K*4 bytes of dynamic smem.
+    extern __shared__ float s_act[];
 
     // Load E4M3 LUT (256 entries, each thread loads 2)
     s_lut[threadIdx.x] = E4M3_LUT_MOE_SHARED[threadIdx.x];

@@ -11,6 +11,11 @@ use crate::gpu::{DevicePtr, GpuBackend};
 
 impl PagedKvCache {
     /// Allocate the KV cache pool on the GPU.
+    ///
+    /// Under the sliding split pool (`config.split_sliding_active()`),
+    /// sliding-window layers are allocated `config.num_sliding_blocks`
+    /// blocks instead of `num_blocks` — their block IDs live in a separate
+    /// (much smaller) ID space served by `alloc_sliding_block`.
     pub fn new(config: KvCacheConfig, num_blocks: usize, gpu: &dyn GpuBackend) -> Result<Self> {
         let mut layers = Vec::with_capacity(config.num_layers);
         let mut total_bytes: usize = 0;
@@ -21,8 +26,13 @@ impl PagedKvCache {
             // allocation that would result from a single MAX-sized stride.
             let k_block_bytes = config.k_block_bytes_for_layer(i);
             let v_block_bytes = config.v_block_bytes_for_layer(i);
-            let k_pool_bytes = num_blocks * k_block_bytes;
-            let v_pool_bytes = num_blocks * v_block_bytes;
+            let layer_blocks = if config.is_sliding_layer(i) {
+                config.num_sliding_blocks
+            } else {
+                num_blocks
+            };
+            let k_pool_bytes = layer_blocks * k_block_bytes;
+            let v_pool_bytes = layer_blocks * v_block_bytes;
             let k_pool = gpu.alloc(k_pool_bytes)?;
             let v_pool = gpu.alloc(v_pool_bytes)?;
             total_bytes += k_pool_bytes + v_pool_bytes;
@@ -37,6 +47,24 @@ impl PagedKvCache {
 
         let free_blocks: Vec<u32> = (0..num_blocks as u32).rev().collect();
         let block_ref_counts = vec![0u32; num_blocks];
+        let free_sliding_blocks: Vec<u32> = if config.split_sliding_active() {
+            (0..config.num_sliding_blocks as u32).rev().collect()
+        } else {
+            Vec::new()
+        };
+        if config.split_sliding_active() {
+            let n_sliding = config.layer_sliding.iter().filter(|s| **s).count();
+            tracing::info!(
+                "KV cache split pool: {} full-attn layers × {} blocks, {} sliding layers × {} \
+                 blocks (ring {} blocks/seq) = {:.1} GB total",
+                config.num_layers - n_sliding,
+                num_blocks,
+                n_sliding,
+                config.num_sliding_blocks,
+                config.sliding_ring_blocks,
+                total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+        }
 
         let has_mixed = !config.layer_dtypes.is_empty()
             && config.layer_dtypes.iter().any(|d| *d != config.dtype);
@@ -69,8 +97,67 @@ impl PagedKvCache {
             num_blocks,
             free_blocks,
             block_ref_counts,
+            free_sliding_blocks,
             config,
         })
+    }
+
+    /// Allocate a block from the SLIDING split pool. Only valid when
+    /// `config.split_sliding_active()`. Sliding blocks are per-sequence
+    /// private ring slots — no ref counting.
+    pub fn alloc_sliding_block(&mut self) -> Result<u32> {
+        self.free_sliding_blocks.pop().ok_or_else(|| {
+            anyhow::anyhow!(
+                "sliding KV pool exhausted: no free sliding blocks \
+                 (num_sliding_blocks={}, ring={} blocks/seq — pool must be sized \
+                 max_batch_size × ring + 1)",
+                self.config.num_sliding_blocks,
+                self.config.sliding_ring_blocks,
+            )
+        })
+    }
+
+    /// Return a sliding-pool block to its free list.
+    pub fn free_sliding_block(&mut self, block_idx: u32) {
+        debug_assert!((block_idx as usize) < self.config.num_sliding_blocks);
+        self.free_sliding_blocks.push(block_idx);
+    }
+
+    /// Number of free blocks in the sliding split pool.
+    pub fn num_free_sliding_blocks(&self) -> usize {
+        self.free_sliding_blocks.len()
+    }
+
+    /// Zero one SLIDING-pool block across all sliding layers. Companion of
+    /// `zero_block` (which covers full-attention layers under the split
+    /// pool). Called once per ring slot at first allocation — ring reuse
+    /// must NOT re-zero (older in-window offsets stay live across wraps).
+    pub fn zero_sliding_block(
+        &self,
+        block_idx: u32,
+        gpu: &dyn crate::gpu::GpuBackend,
+        stream: u64,
+    ) -> anyhow::Result<()> {
+        for (i, layer) in self.layers.iter().enumerate() {
+            if !self.config.is_sliding_layer(i) {
+                continue;
+            }
+            let k_offset = block_idx as usize * layer.k_block_stride;
+            let v_offset = block_idx as usize * layer.v_block_stride;
+            gpu.memset_async(
+                layer.k_pool.offset(k_offset),
+                0,
+                layer.k_block_stride,
+                stream,
+            )?;
+            gpu.memset_async(
+                layer.v_pool.offset(v_offset),
+                0,
+                layer.v_block_stride,
+                stream,
+            )?;
+        }
+        Ok(())
     }
 
     /// Allocate a free block. Returns block index.
@@ -92,7 +179,13 @@ impl PagedKvCache {
         gpu: &dyn crate::gpu::GpuBackend,
         stream: u64,
     ) -> anyhow::Result<()> {
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
+            // Split pool: `block_idx` is a FULL-pool ID; sliding layers have
+            // their own smaller pools (see `zero_sliding_block`). Writing
+            // here would be out of bounds of the sliding allocation.
+            if self.config.is_sliding_layer(i) {
+                continue;
+            }
             let k_offset = block_idx as usize * layer.k_block_stride;
             let v_offset = block_idx as usize * layer.v_block_stride;
             gpu.memset_async(
@@ -125,7 +218,11 @@ impl PagedKvCache {
         gpu: &dyn crate::gpu::GpuBackend,
         stream: u64,
     ) -> anyhow::Result<()> {
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
+            // Split pool: full-pool IDs are out of range of sliding pools.
+            if self.config.is_sliding_layer(i) {
+                continue;
+            }
             let k_offset = block_idx as usize * layer.k_block_stride;
             let v_offset = block_idx as usize * layer.v_block_stride;
             gpu.memset_async(
@@ -442,6 +539,15 @@ impl PagedKvCache {
         self.config.num_layers
     }
 
+    /// Per-sequence sliding ring length R (0 when the split pool is off).
+    pub fn sliding_ring_blocks(&self) -> usize {
+        if self.config.split_sliding_active() {
+            self.config.sliding_ring_blocks
+        } else {
+            0
+        }
+    }
+
     /// Read K and V data for one block at one layer from GPU to host.
     ///
     /// Returns `(k_data, v_data)` sized to each side's block stride
@@ -483,7 +589,29 @@ impl PagedKvCache {
 
     /// Compute how many blocks can fit given available GPU memory.
     /// Accounts for mixed dtypes when layer_dtypes is set.
+    ///
+    /// Under the split pool, the sliding layers' fixed pool cost is
+    /// reserved first and the remainder buys FULL-attention blocks only —
+    /// this is where the sliding-window memory win comes from: the 33
+    /// sliding layers of a Step 3.7 no longer scale with `max_seq_len`.
     pub fn compute_num_blocks(config: &KvCacheConfig, available_bytes: usize) -> Result<usize> {
+        if config.split_sliding_active() {
+            let sliding_bytes = config.sliding_pool_bytes();
+            let full_bpb = config.block_bytes_kv_full_layers();
+            if full_bpb == 0 {
+                bail!("KV cache full-layer block size is zero under split sliding pool");
+            }
+            let remaining = available_bytes.checked_sub(sliding_bytes).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "KV budget {:.2} GB is smaller than the fixed sliding-pool cost {:.2} GB \
+                     ({} blocks); reduce --max-batch-size or --max-prefill-tokens",
+                    available_bytes as f64 / 1e9,
+                    sliding_bytes as f64 / 1e9,
+                    config.num_sliding_blocks,
+                )
+            })?;
+            return Ok(remaining / full_bpb);
+        }
         let bytes_per_block = config.block_bytes_kv_all_layers();
         if bytes_per_block == 0 {
             bail!("KV cache block size is zero");

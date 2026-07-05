@@ -344,6 +344,24 @@ impl DenseFfnLayer {
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
 
+        // Guard: the gate/up GEMMs write [num_tokens, intermediate_size]
+        // BF16 into buffers that hybrid dense+MoE models size from the MoE
+        // dims (max'd with the dense need via config.num_dense_ffn_layers).
+        // A mismatch here is an async out-of-bounds write that poisons the
+        // CUDA context (sticky error 700 at the next sync, far from the
+        // cause) — fail loudly and synchronously instead.
+        let need = num_tokens * ctx.config.intermediate_size * 2;
+        let cap = ctx.buffers.sizes().expert_gate_out;
+        if need > cap {
+            anyhow::bail!(
+                "dense FFN prefill scratch overflow: {num_tokens} tokens × \
+                 intermediate_size {} × 2 B = {need} B exceeds expert_gate_out \
+                 capacity {cap} B. Buffer arena was not sized for this model's \
+                 dense FFN layers (is config.num_dense_ffn_layers set?)",
+                ctx.config.intermediate_size,
+            );
+        }
+
         // BF16 prefill dispatch: dense_gemm_bf16 for all three projections.
         if let Some(ref bf16w) = self.bf16_weights {
             ops::dense_gemm(

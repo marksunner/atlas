@@ -109,6 +109,10 @@ impl Qwen3AttentionLayer {
                     .offset(i * meta.max_blocks_per_seq as usize * 4),
                 max_blocks_per_seq: meta.max_blocks_per_seq,
                 num_seqs: 1,
+                // MLA models are excluded from the sliding split pool at
+                // the factory gate; propagate the (NULL) parent pointers.
+                sliding_slot: meta.sliding_slot,
+                sliding_block_table: meta.sliding_block_table,
             };
             let o_out_i = o_out.offset(i * c.h * bf16);
             self.ms_mla_decode_one(

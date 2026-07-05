@@ -57,6 +57,22 @@ impl TransformerModel {
         } else {
             (meta_base, meta_base)
         };
+        // Sliding split pool: slot twin filled by upload_meta (chunk 0,
+        // host-built) or upload_paged (chunk 1+, fill_slots kernel); the
+        // ring-expanded table only exists on the paged path — chunk 0
+        // attention is contiguous and never reads a block table (full-pool
+        // `block_table_dev` is NULL there too).
+        let ring_len = self.sliding_ring_len();
+        let (sliding_slot, sliding_block_table) = if ring_len > 0 {
+            let sliding_bt = if needs_paged {
+                seq.chunked_prefill_meta.as_ref().unwrap().sliding_block_table
+            } else {
+                DevicePtr::NULL
+            };
+            (self.sliding_prefill_slots_base(), sliding_bt)
+        } else {
+            (DevicePtr(0), DevicePtr(0))
+        };
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
             positions_h: positions_h_dev,
@@ -66,6 +82,8 @@ impl TransformerModel {
             block_table: block_table_dev,
             max_blocks_per_seq: seq.block_table.len() as u32,
             num_seqs: 1,
+            sliding_slot,
+            sliding_block_table,
         };
 
         // Consume the one-shot ATLAS_PROFILE_FIRST flag (additive).

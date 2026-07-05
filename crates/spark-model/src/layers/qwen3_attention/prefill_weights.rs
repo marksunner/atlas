@@ -166,9 +166,17 @@ impl Qwen3AttentionLayer {
     ) -> Result<()> {
         let predequant_k = gpu.kernel("w4a16", "predequant_nvfp4_to_fp8")?;
         let h = config.hidden_size;
-        let nq = config.num_attention_heads;
-        let nkv = config.num_key_value_heads;
-        let hd = config.head_dim;
+        // Honor per-layer dimension overrides so heterogeneous models
+        // (per-layer Q head counts) dequant the true weight extents.
+        // Loaders set overrides before any prefill-weight prep; today's
+        // callers (Qwen3 / Qwen3.5) are homogeneous and leave them None.
+        let nq = self
+            .num_q_heads_override
+            .unwrap_or(config.num_attention_heads);
+        let nkv = self
+            .num_kv_heads_override
+            .unwrap_or(config.num_key_value_heads);
+        let hd = self.head_dim_override.unwrap_or(config.head_dim);
         let q_dim = nq * hd;
         let q_proj_dim = if self.gated { q_dim * 2 } else { q_dim };
         let kv_dim = nkv * hd;

@@ -67,6 +67,14 @@ pub struct ChunkedPrefillPageMetadata {
     pub block_capacity: usize,
     /// Number of block-table entries already uploaded to `block_table`.
     pub uploaded_blocks: usize,
+    /// Sliding split pool: ring-expanded block table (entry `i` =
+    /// `sliding_block_table[i % R]`), same capacity as `block_table`.
+    /// The logical→ring-slot mapping is fixed at allocation, so the
+    /// append-only delta upload works identically. NULL when the split
+    /// pool is off.
+    pub sliding_block_table: DevicePtr,
+    /// Entries already uploaded to `sliding_block_table`.
+    pub uploaded_sliding_blocks: usize,
 }
 
 /// Sequence state tracked across decode steps.
@@ -165,6 +173,14 @@ pub struct SequenceState {
     /// uninitialised. Length equals the model's attention layer count;
     /// empty when HSS is disabled.
     pub disk_last_offloaded_per_layer: Vec<u32>,
+    /// Sliding-window split-pool ring: physical block IDs in the SLIDING
+    /// block-ID space (see `PagedKvCache::alloc_sliding_block`). Logical
+    /// block `i` of this sequence maps to `sliding_block_table[i % R]`
+    /// where R = `KvCacheConfig::sliding_ring_blocks`. Grows lazily up to
+    /// R entries, then wraps — the ring reuses slots exactly as positions
+    /// fall out of every sliding layer's attention window. Empty when the
+    /// split pool is off.
+    pub sliding_block_table: Vec<u32>,
 }
 
 impl SequenceState {
@@ -194,6 +210,25 @@ impl SequenceState {
             return None;
         }
         self.block_table.get(abs_block_idx - ws).copied()
+    }
+
+    /// Map an absolute logical block index → physical SLIDING-pool block id
+    /// via the per-sequence ring. `ring_blocks` is
+    /// `KvCacheConfig::sliding_ring_blocks` (R). Returns `None` when the
+    /// ring slot hasn't been allocated yet (callers must have run
+    /// `ensure_sliding_ring` through this logical block first).
+    #[inline]
+    pub fn sliding_physical_block_for(
+        &self,
+        abs_block_idx: usize,
+        ring_blocks: usize,
+    ) -> Option<u32> {
+        if ring_blocks == 0 {
+            return None;
+        }
+        self.sliding_block_table
+            .get(abs_block_idx % ring_blocks)
+            .copied()
     }
 }
 

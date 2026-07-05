@@ -66,6 +66,9 @@ pub struct BufferArena {
     /// GDN FLA chunked-prefill scratch (W|U|S|uc sub-divided). NULL unless the
     /// model is a 128-dim-linear-head GDN model (ATLAS_GDN_FLA path).
     gdn_fla_scratch: DevicePtr,
+    /// Sliding split-pool metadata staging (slots + ring-expanded block
+    /// tables). NULL unless the model has hybrid full+sliding attention.
+    sliding_meta: DevicePtr,
     /// Maximum batch tokens this arena was sized for.
     max_batch_tokens: usize,
     /// Sizes in bytes for each buffer (for debug/logging).
@@ -108,6 +111,11 @@ impl BufferArena {
         } else {
             DevicePtr::NULL
         };
+        let sliding_meta = if sizes.sliding_meta > 0 {
+            gpu.alloc(sizes.sliding_meta)?
+        } else {
+            DevicePtr::NULL
+        };
 
         tracing::info!(
             "Buffer arena: {} tokens × {:.1} MB total (attn_out={:.1}MB, ssm_deint={:.1}MB, kv_lora_rank={})",
@@ -138,6 +146,7 @@ impl BufferArena {
             expert_down_out,
             splitk_workspace,
             gdn_fla_scratch,
+            sliding_meta,
             max_batch_tokens,
             sizes,
         })
@@ -214,6 +223,16 @@ impl BufferArena {
     }
     pub fn splitk_workspace(&self) -> DevicePtr {
         self.splitk_workspace
+    }
+    /// Sliding split-pool metadata staging base. `DevicePtr::NULL` unless
+    /// the model has hybrid full+sliding attention. Sub-regions are laid
+    /// out by spark-model's `sliding_meta_layout`.
+    pub fn sliding_meta(&self) -> DevicePtr {
+        self.sliding_meta
+    }
+    /// Allocated byte size of the sliding metadata staging buffer.
+    pub fn sliding_meta_bytes(&self) -> usize {
+        self.sizes.sliding_meta
     }
     pub fn max_batch_tokens(&self) -> usize {
         self.max_batch_tokens

@@ -492,6 +492,9 @@ pub fn moe_expert_silu_down_shared_fp8(
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 8), top_k + 1, 1])
         .block([128, 1, 1])
+        // s_act[K] dynamic smem (SiLU(gate)*up precompute) — K can exceed
+        // the old static 1024 floats (Step 3.7 Flash: K=1280).
+        .shared_mem(k * 4)
         .arg_ptr(gate_out)
         .arg_ptr(up_out)
         .arg_ptr(down_weight_ptrs)

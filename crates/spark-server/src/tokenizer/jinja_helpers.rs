@@ -312,6 +312,43 @@ pub(super) fn load_config_template(model_dir: &Path) -> Result<Option<String>> {
     }
 }
 
+/// Load a special-token display string (e.g. `bos_token`, `eos_token`) for
+/// the Jinja rendering context.
+///
+/// Templates from DeepSeek-lineage checkpoints (Step 3.7 Flash, DeepSeek-V3)
+/// reference `{{ bos_token }}` to place the BOS attention-sink token. If the
+/// variable is never supplied it renders as an empty string and BOS is
+/// silently dropped — which makes greedy decode copy-loop within a couple of
+/// sentences. This resolves the string from the same files transformers reads.
+///
+/// Both `special_tokens_map.json` (canonical) and `tokenizer_config.json`
+/// store the token either as a bare string (`"bos_token": "<bos>"`) or as an
+/// `AddedToken` object (`"bos_token": {"content": "<bos>", ...}`). We accept
+/// both. A `null` value (some models explicitly unset BOS) yields `None`.
+pub(super) fn load_special_token(model_dir: &Path, key: &str) -> Option<String> {
+    for file in ["special_tokens_map.json", "tokenizer_config.json"] {
+        let path = model_dir.join(file);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(value) = json.get(key) else {
+            continue;
+        };
+        // Bare-string form: "bos_token": "<bos>".
+        if let Some(s) = value.as_str() {
+            return Some(s.to_string());
+        }
+        // AddedToken object form: "bos_token": {"content": "<bos>", ...}.
+        if let Some(s) = value.get("content").and_then(|c| c.as_str()) {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
 /// Default ChatML template for models without tokenizer_config.json.
 /// Always includes an empty system block if no system message (required by Nemotron-H).
 pub(super) fn default_chatml_template(supports_thinking: bool) -> String {

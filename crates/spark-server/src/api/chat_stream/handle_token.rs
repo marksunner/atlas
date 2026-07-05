@@ -533,6 +533,7 @@ fn process_detector_content(
         }
         state.loop_watchdog_triggered = true;
         state.stop_string_triggered = true;
+        state.content_loop_stop = true;
         state
             .cancel_flag
             .store(true, std::sync::atomic::Ordering::Release);
@@ -606,8 +607,13 @@ pub(super) fn apply_stop_string_holdback(
     // simpler full-string scan here because Atlas accumulators are
     // already bounded by the per-request token budget and the inner
     // memchr-driven `str::find` is O(n) anyway.
+    // #100 Finding 4: skip empty stop strings BEFORE `find` — parity with the
+    // blocking `strip_stop_sequences`. `"".find` matches at position 0, which
+    // would truncate at offset 0 and erase the entire response. The two paths
+    // must handle empty stops identically or streaming and blocking diverge.
     let matched_pos = stop_strings
         .iter()
+        .filter(|s| !s.is_empty())
         .filter_map(|s| accumulated_content.find(s.as_str()))
         .min();
 
@@ -775,5 +781,121 @@ mod stop_string_holdback_tests {
         assert_eq!(out, "a");
         assert!(out.is_char_boundary(out.len()));
         assert!(!triggered);
+    }
+
+    /// Issue #100 streaming: with several stop strings, the EARLIEST in-text
+    /// match wins and everything from it onward is withheld — the same
+    /// "truncate at first occurrence" rule as the blocking `strip_stop_sequences`.
+    #[test]
+    fn multiple_stops_truncate_at_earliest_in_stream() {
+        let stops = vec!["\nuser".to_string(), "\nassistant".to_string()];
+        let buffer_len = "\nassistant".len() - 1;
+        let mut acc = String::new();
+        let mut emitted = 0usize;
+        let mut triggered = false;
+
+        // One chunk: an answer then BOTH role markers. "\nassistant" (pos 6)
+        // is earlier than "\nuser", so the cut is at pos 6.
+        let out = apply_stop_string_holdback(
+            "answer\nassistant x\nuser y",
+            &stops,
+            buffer_len,
+            &mut acc,
+            &mut emitted,
+            &mut triggered,
+        );
+        assert_eq!(out, "answer");
+        assert_eq!(acc, "answer");
+        assert!(triggered);
+        assert!(!out.contains("assistant"), "role marker must not leak");
+    }
+
+    /// Issue #100 streaming: the ChatML end-of-turn marker `<|im_end|>` split
+    /// across two chunks must never leak its partial prefix, and must be fully
+    /// consumed (not echoed) once completed — the clean-stop guarantee for a
+    /// model that surfaces `<|im_end|>` as text rather than a special token.
+    #[test]
+    fn im_end_marker_split_across_chunks_is_clean() {
+        let stops = vec!["<|im_end|>".to_string()];
+        let buffer_len = "<|im_end|>".len() - 1;
+        let mut acc = String::new();
+        let mut emitted = 0usize;
+        let mut triggered = false;
+
+        let d1 = apply_stop_string_holdback(
+            "Hallo!<|im_",
+            &stops,
+            buffer_len,
+            &mut acc,
+            &mut emitted,
+            &mut triggered,
+        );
+        assert!(!d1.contains("<|im_"), "partial marker leaked to client");
+        assert!(!triggered);
+
+        let d2 = apply_stop_string_holdback(
+            "end|> trailing",
+            &stops,
+            buffer_len,
+            &mut acc,
+            &mut emitted,
+            &mut triggered,
+        );
+        assert!(triggered);
+        let total = format!("{d1}{d2}");
+        assert_eq!(total, "Hallo!", "output is exactly the pre-marker text");
+        assert!(!total.contains("<|im_end|>"));
+    }
+
+    /// Issue #100 Finding 4: an empty stop string must be IGNORED in the
+    /// streaming path, exactly as the blocking `strip_stop_sequences` skips it.
+    /// Without the `!s.is_empty()` filter, `"".find` matches at position 0, so
+    /// the holdback would truncate at offset 0 and erase the entire response —
+    /// a silent divergence from the blocking path. Here the real stop `"\nuser"`
+    /// still fires; the empty stop must not pre-empt it at position 0.
+    #[test]
+    fn empty_stop_string_does_not_erase_stream() {
+        let stops = vec![String::new(), "\nuser".to_string()];
+        let buffer_len = "\nuser".len() - 1;
+        let mut acc = String::new();
+        let mut emitted = 0usize;
+        let mut triggered = false;
+
+        let out = apply_stop_string_holdback(
+            "Hello there\nuser echo",
+            &stops,
+            buffer_len,
+            &mut acc,
+            &mut emitted,
+            &mut triggered,
+        );
+        assert_eq!(out, "Hello there", "empty stop must not truncate at pos 0");
+        assert_eq!(acc, "Hello there");
+        assert!(triggered, "the real \\nuser stop still fires");
+    }
+
+    /// Issue #100 Finding 4 (companion): with ONLY an empty stop string, the
+    /// holdback degenerates to the normal buffered pass-through — nothing is
+    /// truncated and `triggered` never flips.
+    #[test]
+    fn only_empty_stop_string_passes_through() {
+        let stops = vec![String::new()];
+        let buffer_len = 5; // holds back the trailing "thing"
+        let mut acc = String::new();
+        let mut emitted = 0usize;
+        let mut triggered = false;
+
+        let out = apply_stop_string_holdback(
+            "keep the whole thing",
+            &stops,
+            buffer_len,
+            &mut acc,
+            &mut emitted,
+            &mut triggered,
+        );
+        assert!(!triggered, "an empty stop must never trigger");
+        // All but the trailing hold-back window is emitted; none is erased.
+        assert_eq!(out, "keep the whole ");
+        assert_eq!(acc, "keep the whole thing");
     }
 }

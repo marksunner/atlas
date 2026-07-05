@@ -21,13 +21,18 @@
 //!    masks `</think>` + `<think>` so the model can't re-enter.
 //! 4. [`tool_during_think::ToolCallDuringThinkingMask`] — masks
 //!    `<tool_call>` during thinking; biases it down on tool-loop.
-//! 5. [`forced_think_end::ForcedThinkEndInjector`] — when budget
+//! 5. [`repeat_tool_open::SuppressRepeatedToolOpen`] — hard-masks a second
+//!    consecutive `<tool_call>` open (always malformed) so the post-think
+//!    greedy tie falls to `\n<function=…>` instead of a doubled opener.
+//! 6. [`forced_think_end::ForcedThinkEndInjector`] — when budget
 //!    + sentence-boundary policy says inject, blanket-mask to `</think>`.
-//! 6. [`pin_tool_call::PinToToolCallStart`] — one-shot pin to
+//! 7. [`pin_tool_call::PinToToolCallStart`] — one-shot pin to
 //!    `<tool_call>` immediately after `</think>` when require_tool_call.
-//! 7. [`forced_token::ForcedTokenFastPath`] — when grammar admits
+//! 8. [`forced_close::ForcedClose`] — near the token budget, force a
+//!    grammar-legal close token so structured output remains parseable.
+//! 9. [`forced_token::ForcedTokenFastPath`] — when grammar admits
 //!    exactly one next token, short-circuit pipeline + sampling.
-//! 8. [`grammar_bitmask::GrammarBitmaskApply`] — apply grammar's
+//! 10. [`grammar_bitmask::GrammarBitmaskApply`] — apply grammar's
 //!    next-token bitmask.
 //!
 //! ## Out of scope
@@ -45,12 +50,14 @@ use spark_runtime::sampler::{SamplingParams, apply_penalties_and_bias};
 pub mod adadec_diag;
 mod b1_margin;
 pub mod f2_confidence;
+pub mod forced_close;
 pub mod forced_think_end;
 pub mod forced_token;
 pub mod grammar_bitmask;
 pub mod mid_word;
 pub mod pin_tool_call;
 pub mod post_close;
+pub mod repeat_tool_open;
 pub mod tool_during_think;
 
 #[cfg(test)]
@@ -128,13 +135,15 @@ pub fn run_pipeline_with_path(
     ctx: &LogitsContext,
     path: &'static str,
 ) -> Option<u32> {
-    let stages: [&dyn LogitsProcessor; 8] = [
+    let stages: [&dyn LogitsProcessor; 10] = [
         &f2_confidence::F2ConfidenceEarlyStop,
         &mid_word::MidWordThinkEndMask,
         &post_close::PostCloseThinkMask,
         &tool_during_think::ToolCallDuringThinkingMask,
+        &repeat_tool_open::SuppressRepeatedToolOpen,
         &forced_think_end::ForcedThinkEndInjector,
         &pin_tool_call::PinToToolCallStart,
+        &forced_close::ForcedClose,
         &forced_token::ForcedTokenFastPath,
         &grammar_bitmask::GrammarBitmaskApply,
     ];

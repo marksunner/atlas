@@ -109,6 +109,12 @@ pub(crate) fn parse_gemma4_params(raw: &serde_json::Value) -> Result<ModelConfig
         config.moe_intermediate_size = moe_intermediate_size;
         config.norm_topk_prob = true;
         config.shared_expert_intermediate_size = 0; // dense MLP is separate, not a shared expert
+        // Gemma-4 26B dual FFN: every layer runs BOTH the dense MLP and
+        // the MoE block. The dense MLP writes [M, intermediate_size]
+        // into the expert intermediate buffers during prefill, so buffer
+        // sizing must take max(top_k × moe_intermediate_size,
+        // intermediate_size) — same hybrid accounting as Step 3.7.
+        config.num_dense_ffn_layers = num_hidden_layers;
     } else {
         config.num_experts = 0;
         config.num_experts_per_tok = 1;

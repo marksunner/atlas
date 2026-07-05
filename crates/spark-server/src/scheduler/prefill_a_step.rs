@@ -53,6 +53,7 @@ pub fn start_chunked_prefill(
         tracing::info!("Thinking enabled, budget={:?}", req_thinking_budget);
     }
     let req_require_tool_call = req.require_tool_call();
+    let req_tools_active = req.tools_active();
     let req_suppress_tool_call = req.suppress_tool_call();
     let req_disable_mtp = req.disable_mtp();
     let req_seed = req.seed();
@@ -234,9 +235,14 @@ pub fn start_chunked_prefill(
         // When grammar is active, disable legacy require_tool_call (grammar handles EOS).
         let use_legacy_tool_call =
             req_require_tool_call && grammar_state.is_none() && tool_call_start_token.is_some();
-        // F4: sticky tool-request flag — grammar attached OR legacy tool path.
-        // Computed before `grammar_state` is moved into the ActiveSeq below.
-        let tool_request = grammar_state.is_some() || use_legacy_tool_call;
+        // F4: sticky tool-request flag — grammar attached OR legacy tool path
+        // OR any tools-active turn. Round 14: `req_tools_active` covers the
+        // `disable_tool_grammar=true` + `tool_choice="auto"` case, where both
+        // `grammar_state` and `use_legacy_tool_call` are absent yet this is a
+        // genuine tool turn (needed so the doubled-`<tool_call>` suppressor and
+        // the inter-tool prose watchdog activate). Computed before
+        // `grammar_state` is moved into the ActiveSeq below.
+        let tool_request = grammar_state.is_some() || use_legacy_tool_call || req_tools_active;
 
         let now = Instant::now();
         let cached_prompt_tok = seq.cached_prefix_tokens as u32;
@@ -303,6 +309,7 @@ pub fn start_chunked_prefill(
                 ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
                 tool_call_end_token,
                 grammar_state,
+                forced_close_activated: false,
                 last_token_time: now,
                 request_start,
                 decode_start: now,
@@ -390,6 +397,7 @@ pub fn start_chunked_prefill(
                 ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
                 tool_call_end_token,
                 grammar_state,
+                forced_close_activated: false,
                 last_token_time: now,
                 request_start,
                 decode_start: now,
@@ -435,6 +443,7 @@ pub fn start_chunked_prefill(
             repetition_detection: req_repetition_detection,
             spontaneous_think_budget,
             require_tool_call: req_require_tool_call,
+            tools_active: req_tools_active,
             suppress_tool_call: req_suppress_tool_call,
             disable_mtp: req_disable_mtp,
             grammar_state,

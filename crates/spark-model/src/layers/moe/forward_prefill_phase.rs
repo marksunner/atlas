@@ -115,6 +115,10 @@ impl MoeLayer {
             )?;
         }
 
+        // Step 3.7 swiglu_limits_shared: clamp shared gate/up before
+        // activation (no-op on layers without limits).
+        self.clamp_shared_gate_up(ctx.gpu, shared_gate_out, shared_up_out, n * shared_inter, aux)?;
+
         // Shared activation (SiLU or GeGLU) + down GEMM on aux stream
         ops::silu_mul(
             ctx.gpu,

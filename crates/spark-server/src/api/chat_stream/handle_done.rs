@@ -220,6 +220,13 @@ pub(super) fn handle_done(
         || state.salvaged_tool_call
     {
         "tool_calls"
+    } else if state.content_loop_stop {
+        // Content-loop guard (F4 SimHash / exact-line watchdog) cut the
+        // response at a sentence boundary. Everything delivered up to the
+        // trip is coherent; report "stop" so agent clients accept it as a
+        // complete turn instead of requesting a continuation of the loop
+        // (the scheduler-side finish_reason would otherwise be "length").
+        "stop"
     } else {
         finish_reason.as_str()
     };

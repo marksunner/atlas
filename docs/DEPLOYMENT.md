@@ -49,10 +49,10 @@ if you want more KV headroom and have nothing else competing for the GPU.
 
 ## 2. Multi-rank EP=2 / TP=2
 
-Models that don't fit on one GB10 (122B-A10B, MiniMax-M2 / M2.7,
-Mistral-Small-4, Nemotron-Super-120B) shard across two nodes via NCCL +
-RoCEv2 (or fast Ethernet). The two ranks share one OpenAI endpoint exposed
-on rank 0.
+Models that don't fit on one GB10 (122B-A10B, Step 3.7 Flash,
+MiniMax-M2 / M2.7, Mistral-Small-4, Nemotron-Super-120B) shard across
+two nodes via NCCL + RoCEv2 (or fast Ethernet). The two ranks share one
+OpenAI endpoint exposed on rank 0.
 
 ### Topology options
 
@@ -73,6 +73,19 @@ bash scripts/start-ep2.sh Sehyo/Qwen3.5-122B-A10B-NVFP4
 HEAD_IP=10.0.0.1 WORKER_IP=10.0.0.2 \
   bash scripts/start-ep2.sh Sehyo/Qwen3.5-122B-A10B-NVFP4
 ```
+
+Step 3.7 Flash uses the same EP=2 launcher:
+
+```bash
+HEAD_IP=10.0.0.1 WORKER_IP=10.0.0.2 \
+  bash scripts/start-ep2.sh stepfun-ai/Step-3.7-Flash-NVFP4
+```
+
+For production Step 3.7 deployments, prefer the preprocessed per-expert
+checkpoint described in [`docs/STEP3P7_FLASH_RESULTS.md`](STEP3P7_FLASH_RESULTS.md).
+The original fused checkpoint is supported by the preflight estimator, but
+the split checkpoint keeps per-rank load behavior explicit and easier to
+audit on 2× DGX Spark.
 
 What the launcher does:
 - Forces `NCCL_SOCKET_IFNAME=enp1s0f0np0` (GB10 RDMA NIC) — change for

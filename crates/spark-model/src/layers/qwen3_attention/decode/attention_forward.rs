@@ -68,6 +68,10 @@ impl Qwen3AttentionLayer {
         let meta = ctx
             .attn_metadata
             .expect("attention layer requires pre-uploaded metadata");
+        // Sliding split pool: sliding layers swap in the ring twin
+        // (slot + block table in the sliding block-ID space). No-op for
+        // full-attention layers and for models without the split pool.
+        let meta = self.meta_for_layer(&meta, kv_cache)?;
 
         // ── MLA 2-step decode ── (extracted to attention_forward_mla.rs)
         if self.mla.is_some() {
@@ -87,132 +91,7 @@ impl Qwen3AttentionLayer {
             return self.attention_forward_mla(kv_cache, ctx, &args);
         }
 
-        if self.gated {
-            // Q+Gate projection with inline deinterleave (output is [Q_all | Gate_all])
-            if let Some(fp8) = self.q_weight.as_ref().and_then(|w| w.as_fp8()) {
-                // FP8 native: w8a16_gemv + separate deinterleave (no fused QG variant yet)
-                ops::w8a16_gemv(
-                    ctx.gpu,
-                    self.w8a16_gemv_k,
-                    normed,
-                    fp8.weight,
-                    fp8.row_scale,
-                    q_out,
-                    q_proj_dim,
-                    h,
-                    stream,
-                )?;
-                ops::deinterleave_qg(
-                    ctx.gpu,
-                    self.deinterleave_qg_k,
-                    q_out,
-                    1,
-                    nq,
-                    hd,
-                    nq * hd * 2,
-                    stream,
-                )?;
-            } else if let Some(nvfp4) = self.q_weight.as_ref().and_then(|w| w.as_nvfp4()) {
-                ops::w4a16_gemv_qg(
-                    ctx.gpu,
-                    self.w4a16_gemv_qg_k,
-                    normed,
-                    nvfp4,
-                    q_out,
-                    q_proj_dim,
-                    h,
-                    nq,
-                    hd,
-                    stream,
-                )?;
-            } else {
-                ops::dense_gemv(
-                    ctx.gpu,
-                    self.dense_gemv_k,
-                    normed,
-                    &self.attn.q_proj,
-                    q_out,
-                    q_proj_dim,
-                    h,
-                    stream,
-                )?;
-                ops::deinterleave_qg(
-                    ctx.gpu,
-                    self.deinterleave_qg_k,
-                    q_out,
-                    1,
-                    nq,
-                    hd,
-                    nq * hd * 2,
-                    stream,
-                )?;
-            }
-        } else {
-            // Ungated: Q projection only (no gate)
-            if let Some(fp8) = self.q_weight.as_ref().and_then(|w| w.as_fp8()) {
-                ops::w8a16_gemv(
-                    ctx.gpu,
-                    self.w8a16_gemv_k,
-                    normed,
-                    fp8.weight,
-                    fp8.row_scale,
-                    q_out,
-                    q_dim,
-                    h,
-                    stream,
-                )?;
-            } else if let Some(nvfp4) = self.q_weight.as_ref().and_then(|w| w.as_nvfp4()) {
-                ops::w4a16_gemv(
-                    ctx.gpu,
-                    self.w4a16_gemv_k,
-                    normed,
-                    nvfp4,
-                    q_out,
-                    q_dim,
-                    h,
-                    stream,
-                )?;
-            } else {
-                ops::dense_gemv(
-                    ctx.gpu,
-                    self.dense_gemv_k,
-                    normed,
-                    &self.attn.q_proj,
-                    q_out,
-                    q_dim,
-                    h,
-                    stream,
-                )?;
-            }
-        }
-
-        // DIAG: dump normed input and Q output for L0
-        if self.attn_layer_idx == 0 && ctx.profile {
-            ctx.gpu.synchronize(stream)?;
-            let mut input_buf = vec![0u8; 16]; // first 8 BF16 values
-            ctx.gpu.copy_d2h(normed, &mut input_buf)?;
-            let input_vals: Vec<f32> = input_buf
-                .chunks_exact(2)
-                .map(|c| {
-                    let bits = u16::from_le_bytes([c[0], c[1]]);
-                    f32::from_bits((bits as u32) << 16)
-                })
-                .collect();
-            let mut q_buf = vec![0u8; 16];
-            ctx.gpu.copy_d2h(q_out, &mut q_buf)?;
-            let q_vals: Vec<f32> = q_buf
-                .chunks_exact(2)
-                .map(|c| {
-                    let bits = u16::from_le_bytes([c[0], c[1]]);
-                    f32::from_bits((bits as u32) << 16)
-                })
-                .collect();
-            tracing::info!(
-                "GEMV_DIAG L0: input[0:8]={:.4?} q_out[0:8]={:.4?} nq={nq} hd={hd} h={h}",
-                input_vals,
-                q_vals
-            );
-        }
+        self.attention_forward_q(normed, q_out, q_dim, q_proj_dim, h, nq, hd, ctx, stream)?;
 
         // K+V output after Q projection region
         let k_out = q_out.offset(q_proj_bytes);
@@ -345,6 +224,26 @@ impl Qwen3AttentionLayer {
                 hd,
                 self.rotary_dim_override
                     .unwrap_or(ctx.config.rotary_dim() as u32),
+                self.rope_theta_override
+                    .unwrap_or(ctx.config.rope_theta as f32),
+                stream,
+            )?;
+        } else if !self.rope_inv_freq_table.is_null() {
+            // llama3 (NTK-by-parts) RoPE: read frequencies from the
+            // precomputed per-layer table (Step 3.7 full-attention layers).
+            ops::rope_yarn(
+                ctx.gpu,
+                self.rope_yarn_k,
+                q_out,
+                k_out,
+                meta.positions,
+                1,
+                nq,
+                nkv,
+                hd,
+                self.rotary_dim_override
+                    .unwrap_or(ctx.config.rotary_dim() as u32),
+                self.rope_inv_freq_table,
                 self.rope_theta_override
                     .unwrap_or(ctx.config.rope_theta as f32),
                 stream,

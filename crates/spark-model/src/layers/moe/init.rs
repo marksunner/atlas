@@ -145,6 +145,15 @@ impl MoeLayer {
             moe_silu_mul: gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
             moe_act_mul: gpu.kernel("moe_silu_mul", "moe_silu_mul")?, // default: SiLU
             gelu_activation: false,
+            // SwiGLU clamp (Step 3.7 swiglu_limits). try_kernel: targets that
+            // don't ship the module keep handle 0; the limits below default
+            // to 0.0 (disabled) and are set post-construction by loaders of
+            // models whose config carries per-layer limits.
+            swiglu_clamp_k: super::super::try_kernel(gpu, "swiglu_clamp", "swiglu_clamp_bf16"),
+            swiglu_gate_max: 0.0,
+            swiglu_up_limit: 0.0,
+            swiglu_gate_max_shared: 0.0,
+            swiglu_up_limit_shared: 0.0,
             moe_unpermute_reduce: gpu.kernel("moe", "moe_unpermute_reduce_indexed")?,
             moe_batched_blend: gpu.kernel("moe", "moe_batched_blend")?,
             gate_ptrs,

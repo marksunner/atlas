@@ -13,6 +13,38 @@
 
 use super::*;
 
+/// N-gram loop watchdog tuning (see the detector block in
+/// [`handle_content_token`]). Window/threshold calibrated against the
+/// 2026-07-04 Step 3.7 story battery: catastrophic runs measure
+/// 0.65-0.91 repeated-3-gram fraction offline; token-level repeated
+/// 8-grams on the same outputs sit even higher, while clean creative
+/// prose stays under ~0.25.
+const NGRAM_LOOP_WINDOW: usize = 384;
+const NGRAM_LOOP_N: usize = 5;
+const NGRAM_LOOP_THRESHOLD: f32 = 0.45;
+const NGRAM_LOOP_CHECK_STRIDE: u32 = 64;
+const NGRAM_LOOP_MIN_CONTENT: u32 = 256;
+
+/// Fraction of n-grams in the trailing `window` of `tokens` that occur
+/// more than once within that window. 0.0 when the window has fewer
+/// than 2 n-grams.
+fn repeated_ngram_fraction(tokens: &[u32], window: usize, n: usize) -> f32 {
+    let len = tokens.len();
+    let start = len.saturating_sub(window);
+    let tail = &tokens[start..];
+    if tail.len() < n + 1 {
+        return 0.0;
+    }
+    let total = tail.len() - n + 1;
+    let mut counts: std::collections::HashMap<&[u32], u32> =
+        std::collections::HashMap::with_capacity(total);
+    for i in 0..total {
+        *counts.entry(&tail[i..i + n]).or_insert(0) += 1;
+    }
+    let repeated: u32 = counts.values().filter(|&&c| c > 1).sum();
+    repeated as f32 / total as f32
+}
+
 /// Slow-path diagnostic: when `detect_content_token_loop` returns
 /// `true`, re-scan to report which `(period, repeats)` matched. Used
 /// only on the watchdog-fired branch — runs once per fire, never on
@@ -171,7 +203,64 @@ pub fn handle_content_token(a: &mut ActiveSeq, model: &dyn Model) {
                     CONTENT_LOOP_PERIOD_MIN,
                     CONTENT_LOOP_PERIOD_MAX,
                 );
+                // Push an EOS so finish_sequence reports "stop", not
+                // "length" (same trick as the <|im_start|> hard stop in
+                // emit_step.rs). The content delivered up to the cut is
+                // coherent; "length" makes agent clients request a
+                // continuation of the very loop we just cut (observed
+                // 2026-07-04: 3 continuation calls, 98s for one story).
+                if let Some(&eos) = a.eos_tokens.first() {
+                    a.output_tokens.push(eos);
+                }
                 a.finished = true;
+            }
+        }
+    }
+
+    // N-gram-frequency loop watchdog (2026-07-04 iteration 2). The anchored
+    // period-2…64 detector above only catches VERBATIM short-period repeats;
+    // the Step 3.7 story attractors that escaped it are sentence-level loops
+    // with small variations ("…about a clockwork X" ×22, "he had written Y"
+    // ×44 — matched period >64 or non-verbatim), which then burn to
+    // max_tokens (65536 on real Hermes requests ≈ 50 min of decode). This
+    // detector measures what the offline rep3 metric measures: the fraction
+    // of repeated 8-grams over the last NGRAM_LOOP_WINDOW content tokens.
+    // Legit prose stays well under 0.3 even with refrains; the observed
+    // attractors sit at 0.65-0.9. Same rollback/fallback machinery, same
+    // gates as the anchored watchdog.
+    if !crate::scheduler::helpers::disable_watchdogs()
+        && enable_loop_watchdog()
+        && !a.inside_tool_body
+        && a.content_tokens >= NGRAM_LOOP_MIN_CONTENT
+        && a.content_tokens.is_multiple_of(NGRAM_LOOP_CHECK_STRIDE)
+    {
+        let frac = repeated_ngram_fraction(&a.output_tokens, NGRAM_LOOP_WINDOW, NGRAM_LOOP_N);
+        if frac >= NGRAM_LOOP_THRESHOLD {
+            match rollback_to_boundary(a, CONTENT_LOOP_PERIOD_MAX, model) {
+                RollbackOutcome::RolledBack { dropped } => {
+                    tracing::warn!(
+                        content_tokens = a.content_tokens,
+                        repeated_ngram_fraction = frac,
+                        dropped,
+                        rollback = a.rollback_count,
+                        "N-gram loop watchdog fired (repeated n-gram fraction over trailing window); rolled back to boundary, re-steering"
+                    );
+                }
+                RollbackOutcome::Fallback(reason) => {
+                    tracing::warn!(
+                        content_tokens = a.content_tokens,
+                        repeated_ngram_fraction = frac,
+                        ?reason,
+                        "N-gram loop watchdog fired; ending response early (rollback declined)."
+                    );
+                    // Same EOS trick as the anchored watchdog above: report
+                    // finish="stop" so agent clients don't request a
+                    // continuation of the loop.
+                    if let Some(&eos) = a.eos_tokens.first() {
+                        a.output_tokens.push(eos);
+                    }
+                    a.finished = true;
+                }
             }
         }
     }

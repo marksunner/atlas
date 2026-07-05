@@ -5,8 +5,13 @@
 //! Hybrid of MiniMax M2 and Qwen 3.5 patterns:
 //!   * Sigmoid MoE routing + correction bias (MiniMax M2 pattern)
 //!   * Shared expert per MoE layer (Qwen 3.5 pattern)
-//!   * Attention gate g_proj (Qwen 3.5 pattern)
-//!   * Partial RoPE 0.5 (MiniMax M2 pattern)
+//!   * Per-HEAD attention gate g_proj [nq, hidden] — sigmoid scalar per
+//!     head broadcast over head_dim (NOT Qwen 3.5's interleaved Q+G)
+//!   * Per-layer RoPE: theta=5e6/prf=0.5 on full-attention layers,
+//!     theta=1e4/prf=1.0 on sliding layers (rope_theta_per_layer /
+//!     partial_rotary_factors from config)
+//!   * Heterogeneous Q heads: 64 on full-attention layers, 96 on sliding
+//!     (detected from q_proj shape, applied via dimension overrides)
 //!   * Per-head q_norm / k_norm
 //!   * Mixed dense FFN (layers 0-2) + MoE (layers 3-44)
 //!   * 3 MTP modules at layers 45-47 (different prefix: `model.layers.`)
@@ -22,6 +27,7 @@
 //! NVFP4 format: ModelOpt style with `weight`, `weight_scale`, `weight_scale_2`,
 //! `input_scale` per projection. Shared expert is BF16.
 
+mod fp8;
 mod load_layers;
 
 use anyhow::Result;
@@ -35,6 +41,28 @@ use crate::layer::TransformerLayer;
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight, dense};
 
 pub struct Step3p7WeightLoader;
+
+/// Resolve the text-stack weight prefix by probing the store.
+///
+/// The NVFP4 release nests the language model under
+/// `model.language_model.layers.*`; the FP8 release stores it directly
+/// under `model.layers.*`. Probe for layer 0's input norm to pick the
+/// right namespace instead of trusting the config constant.
+fn resolve_weight_prefix(store: &WeightStore, config: &atlas_core::config::ModelConfig) -> String {
+    let configured = if config.weight_prefix.is_empty() {
+        "model.language_model"
+    } else {
+        &config.weight_prefix
+    };
+    if store.contains(&format!("{configured}.layers.0.input_layernorm.weight")) {
+        return configured.to_string();
+    }
+    if store.contains("model.layers.0.input_layernorm.weight") {
+        tracing::info!("step3p7: text stack found under `model.layers.*` (FP8-release layout)");
+        return "model".to_string();
+    }
+    configured.to_string()
+}
 
 /// Step 3.7 uses shifted RMSNorm: `output = (x / rms) * (weight + 1)`.
 /// The checkpoint stores norm weights centered around 0, not 1.
@@ -74,12 +102,15 @@ fn offset_norm_weights_plus_one(
 ///
 /// This function creates `num_experts` QuantizedWeight entries, each
 /// pointing to a different offset within the fused allocations.
+#[allow(clippy::too_many_arguments)]
 fn slice_fused_experts(
     fused_weight: DevicePtr,
     fused_scale: DevicePtr,
     fused_input_scale: DevicePtr,
     global_scale_2: f32,
     num_experts: usize,
+    local_start: usize,
+    local_end: usize,
     n: usize,
     k: usize,
 ) -> Vec<QuantizedWeight> {
@@ -89,15 +120,21 @@ fn slice_fused_experts(
     let input_scale_bytes_per_expert = n * 4;
 
     (0..num_experts)
-        .map(|e| QuantizedWeight {
-            weight: fused_weight.offset(e * packed_bytes_per_expert),
-            weight_scale: fused_scale.offset(e * scale_bytes_per_expert),
-            weight_scale_2: global_scale_2,
-            input_scale: if fused_input_scale == DevicePtr::NULL {
-                DevicePtr::NULL
-            } else {
-                fused_input_scale.offset(e * input_scale_bytes_per_expert)
-            },
+        .map(|e| {
+            if e < local_start || e >= local_end {
+                return QuantizedWeight::null();
+            }
+            let local_expert = e - local_start;
+            QuantizedWeight {
+                weight: fused_weight.offset(local_expert * packed_bytes_per_expert),
+                weight_scale: fused_scale.offset(local_expert * scale_bytes_per_expert),
+                weight_scale_2: global_scale_2,
+                input_scale: if fused_input_scale == DevicePtr::NULL {
+                    DevicePtr::NULL
+                } else {
+                    fused_input_scale.offset(local_expert * input_scale_bytes_per_expert)
+                },
+            }
         })
         .collect()
 }
@@ -151,11 +188,7 @@ impl ModelWeightLoader for Step3p7WeightLoader {
     }
 
     fn load_embedding(&self, store: &WeightStore, config: &ModelConfig) -> Result<DenseWeight> {
-        let prefix = if config.weight_prefix.is_empty() {
-            "model.language_model"
-        } else {
-            &config.weight_prefix
-        };
+        let prefix = resolve_weight_prefix(store, config);
         dense(store, &format!("{prefix}.embed_tokens.weight"))
     }
 
@@ -165,11 +198,7 @@ impl ModelWeightLoader for Step3p7WeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
-        let prefix = if config.weight_prefix.is_empty() {
-            "model.language_model"
-        } else {
-            &config.weight_prefix
-        };
+        let prefix = resolve_weight_prefix(store, config);
         let w = dense(store, &format!("{prefix}.norm.weight"))?;
         offset_norm_weights_plus_one(&w, config.hidden_size, gpu)?;
         Ok(w)

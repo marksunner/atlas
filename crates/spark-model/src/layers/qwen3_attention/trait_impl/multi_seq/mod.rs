@@ -62,6 +62,11 @@ impl Qwen3AttentionLayer {
         let meta = ctx
             .attn_metadata
             .expect("attention layer requires metadata");
+        // Sliding split pool: sliding layers swap in the ring twin — the
+        // batched sliding slots/tables were staged by upload_sliding_batch
+        // with the same row stride as the full-pool arrays, so the phase
+        // helpers' per-row offset math is unchanged.
+        let meta = self.meta_for_layer(&meta, kv_cache)?;
 
         // ── Phases 2-6: attention ──
         // MLA models (Mistral-Small-4) take the dedicated absorbed-MLA

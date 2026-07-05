@@ -31,22 +31,43 @@ impl Qwen3AttentionLayer {
             let q_out_i = qkv_buf.offset(i * per_seq_qkv);
             let k_out_i = q_out_i.offset(q_proj_bytes);
             let pos_i = meta.positions.offset(i * 4); // u32 per position
-            ops::rope(
-                fwd.gpu,
-                self.rope_k,
-                q_out_i,
-                k_out_i,
-                pos_i,
-                1,
-                nq,
-                nkv,
-                hd,
-                self.rotary_dim_override
-                    .unwrap_or(fwd.config.rotary_dim() as u32),
-                self.rope_theta_override
-                    .unwrap_or(fwd.config.rope_theta as f32),
-                stream,
-            )?;
+            if !self.rope_inv_freq_table.is_null() {
+                // llama3 (NTK-by-parts) RoPE table (Step 3.7 full-attention).
+                ops::rope_yarn(
+                    fwd.gpu,
+                    self.rope_yarn_k,
+                    q_out_i,
+                    k_out_i,
+                    pos_i,
+                    1,
+                    nq,
+                    nkv,
+                    hd,
+                    self.rotary_dim_override
+                        .unwrap_or(fwd.config.rotary_dim() as u32),
+                    self.rope_inv_freq_table,
+                    self.rope_theta_override
+                        .unwrap_or(fwd.config.rope_theta as f32),
+                    stream,
+                )?;
+            } else {
+                ops::rope(
+                    fwd.gpu,
+                    self.rope_k,
+                    q_out_i,
+                    k_out_i,
+                    pos_i,
+                    1,
+                    nq,
+                    nkv,
+                    hd,
+                    self.rotary_dim_override
+                        .unwrap_or(fwd.config.rotary_dim() as u32),
+                    self.rope_theta_override
+                        .unwrap_or(fwd.config.rope_theta as f32),
+                    stream,
+                )?;
+            }
         }
         Ok(())
     }
@@ -226,6 +247,39 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             }
+        }
+
+        // Per-head attention gate (Step 3.7 g_proj) — multi-seq batched
+        // decode (K=2 / K=3 MTP verify). Mirrors decode/attention_forward.rs:
+        // gate[t, h] = g_proj(normed[t]), then sigmoid broadcast over
+        // head_dim onto attn_out before o_proj (vLLM step3p5.py
+        // `Step3p5Attention.forward`). `c.normed` ([n, h], phase-1 output)
+        // is still live here; the ssm_qkvz scratch held the contiguous Q
+        // rows, which phase 5's paged decode has already consumed.
+        if let Some(ref g_proj) = self.head_gate_weight {
+            let gate_buf = fwd.buffers.ssm_qkvz();
+            ops::dense_gemm_tc(
+                fwd.gpu,
+                self.dense_gemm_tc_k,
+                c.normed,
+                g_proj,
+                gate_buf,
+                n as u32,
+                nq,
+                h as u32,
+                stream,
+            )?;
+            ops::sigmoid_gate_mul_head_broadcast(
+                fwd.gpu,
+                self.sigmoid_gate_head_broadcast_k,
+                attn_out,
+                gate_buf,
+                attn_out,
+                nq,
+                hd,
+                n as u32,
+                stream,
+            )?;
         }
 
         let o_out = fwd.buffers.moe_output();

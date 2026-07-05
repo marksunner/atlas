@@ -82,6 +82,13 @@ pub struct Qwen3AttentionLayer {
     /// Per-layer RoPE overrides for heterogeneous models (Gemma-4).
     pub(crate) rope_theta_override: Option<f32>,
     pub(crate) rotary_dim_override: Option<u32>,
+    /// Precomputed per-layer inv_freq table [rotary_dim/2] FP32 on GPU for
+    /// llama3 (NTK-by-parts) RoPE frequency scaling. NULL = compute
+    /// frequencies from `rope_theta_override` in the standard RoPE kernel.
+    /// When non-NULL, the standard (non-MLA) RoPE dispatch routes through
+    /// the table-based `rope_forward_yarn` kernel instead. Set on Step 3.7
+    /// full-attention layers so long-range retrieval survives >8K context.
+    pub(crate) rope_inv_freq_table: spark_runtime::gpu::DevicePtr,
     /// Proportional RoPE (Gemma-4 full-attention).
     pub(crate) rope_proportional: bool,
     /// Per-layer attention scale override (Gemma-4: 1.0 because QK-norm

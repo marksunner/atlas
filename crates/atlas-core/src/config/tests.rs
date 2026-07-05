@@ -437,3 +437,167 @@ fn test_parse_gemma4_config() {
     // Rotary dim
     assert_eq!(cfg.rotary_dim(), 64); // 0.25 * 256
 }
+
+#[test]
+fn test_parse_step3p7_per_layer_rope_and_heads() {
+    // Minimal Step 3.7 Flash shape: nested text_config, per-layer
+    // rope_theta / partial_rotary_factors arrays (5e6 / 0.5 on
+    // full-attention layers, 1e4 / 1.0 on sliding), heterogeneous Q
+    // heads via attention_other_setting (64 full / 96 sliding), and
+    // MTP entries appended to the per-layer arrays (truncated on parse).
+    let json = r#"{
+        "model_type": "step3p7",
+        "text_config": {
+            "hidden_size": 4096,
+            "num_hidden_layers": 8,
+            "num_attention_heads": 64,
+            "num_attention_groups": 8,
+            "head_dim": 128,
+            "intermediate_size": 8192,
+            "vocab_size": 128896,
+            "moe_num_experts": 288,
+            "moe_top_k": 8,
+            "moe_intermediate_size": 1280,
+            "share_expert_dim": 1280,
+            "moe_router_activation": "sigmoid",
+            "moe_router_scaling_factor": 3.0,
+            "use_moe_router_bias": true,
+            "norm_expert_weight": true,
+            "use_head_wise_attn_gate": true,
+            "partial_rotary_factor": 0.5,
+            "sliding_window": 512,
+            "moe_layers_enum": "3,4,5,6,7",
+            "num_nextn_predict_layers": 3,
+            "eos_token_id": [1, 2, 128007],
+            "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 65536,
+            "attention_other_setting": {
+                "attention_type": "sliding_attention",
+                "num_attention_heads": 96,
+                "num_attention_groups": 8,
+                "head_dim": 128
+            },
+            "layer_types": [
+                "full_attention", "sliding_attention", "sliding_attention",
+                "sliding_attention", "full_attention", "sliding_attention",
+                "sliding_attention", "sliding_attention",
+                "sliding_attention", "sliding_attention", "sliding_attention"
+            ],
+            "rope_theta": [
+                5000000.0, 10000.0, 10000.0, 10000.0, 5000000.0, 10000.0,
+                10000.0, 10000.0, 10000.0, 10000.0, 10000.0
+            ],
+            "partial_rotary_factors": [
+                0.5, 1.0, 1.0, 1.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
+            ]
+        }
+    }"#;
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.model_type, "step3p7");
+    assert!(cfg.nested_config);
+
+    // Scalar fallbacks keep the full-attention values.
+    assert_eq!(cfg.rope_theta, 5_000_000.0);
+    assert_eq!(cfg.partial_rotary_factor, 0.5);
+    assert_eq!(cfg.rotary_dim(), 64); // 0.5 * 128
+
+    // Per-layer RoPE arrays preserved and truncated to num_hidden_layers
+    // (MTP tail entries dropped, same as layer_types).
+    assert_eq!(cfg.rope_theta_per_layer.len(), 8);
+    assert_eq!(cfg.partial_rotary_factors.len(), 8);
+    assert_eq!(cfg.rope_theta_per_layer[0], 5_000_000.0);
+    assert_eq!(cfg.rope_theta_per_layer[1], 10_000.0);
+    assert_eq!(cfg.rope_theta_per_layer[4], 5_000_000.0);
+    assert_eq!(cfg.partial_rotary_factors[0], 0.5);
+    assert_eq!(cfg.partial_rotary_factors[1], 1.0);
+    assert_eq!(cfg.partial_rotary_factors[4], 0.5);
+
+    // Layer types truncated to 8; sliding layers detected.
+    assert_eq!(cfg.layer_types.len(), 8);
+    assert_eq!(cfg.layer_type(0), LayerType::FullAttention);
+    assert_eq!(cfg.layer_type(1), LayerType::SlidingAttention);
+    assert_eq!(cfg.sliding_window, 512);
+
+    // num_attention_heads is the per-layer MAX (96 sliding > 64 full)
+    // for buffer sizing; per-layer counts come from q_proj shapes at load.
+    assert_eq!(cfg.num_attention_heads, 96);
+    assert_eq!(cfg.num_key_value_heads, 8);
+    assert_eq!(cfg.head_dim, 128);
+
+    // Per-head g_proj gating is wired via head_gate_weight, NOT the
+    // Qwen3-Next interleaved Q+G pipeline — attn_gated must stay false.
+    assert!(!cfg.attn_gated);
+
+    // MoE + MTP mapping.
+    assert_eq!(cfg.num_experts, 288);
+    assert_eq!(cfg.num_experts_per_tok, 8);
+    assert_eq!(cfg.shared_expert_intermediate_size, 1280);
+    assert_eq!(cfg.num_mtp_modules, 3);
+    assert_eq!(cfg.eos_token_id, 128007);
+
+    // Dense-FFN layer count derived from moe_layers_enum ("3,4,5,6,7" →
+    // 5 MoE of 8 hidden → 3 dense). Buffer sizing uses this to cover the
+    // dense layers' [M, intermediate_size] writes into the expert
+    // intermediate buffers (chunked-prefill CUDA-700 fix).
+    assert_eq!(cfg.num_dense_ffn_layers, 3);
+
+    // llama3 RoPE scaling is absent in this fixture → disabled.
+    assert_eq!(cfg.rope_llama3_factor, 0.0);
+    assert!(!cfg.rope_llama3_full_attention_only);
+}
+
+#[test]
+fn test_parse_step3p7_llama3_rope_scaling() {
+    // Step 3.7 restricts llama3 (NTK-by-parts) RoPE frequency scaling to
+    // full-attention layers via `yarn_only_types`. The parser must capture
+    // the scaling params and the full-attention-only flag; the weight
+    // loader uses them to build per-layer inv_freq tables. Dropping this
+    // (as an earlier revision did by stripping `yarn_only_types`) is the
+    // >8K-context content-degeneration cliff.
+    let json = r#"{
+        "model_type": "step3p7",
+        "text_config": {
+            "hidden_size": 4096,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 64,
+            "num_attention_groups": 8,
+            "head_dim": 128,
+            "intermediate_size": 8192,
+            "vocab_size": 128896,
+            "moe_num_experts": 288,
+            "moe_top_k": 8,
+            "moe_intermediate_size": 1280,
+            "share_expert_dim": 1280,
+            "partial_rotary_factor": 0.5,
+            "sliding_window": 512,
+            "num_nextn_predict_layers": 3,
+            "eos_token_id": [1, 2, 128007],
+            "max_position_embeddings": 65536,
+            "layer_types": [
+                "full_attention", "sliding_attention",
+                "sliding_attention", "sliding_attention"
+            ],
+            "rope_theta": [5000000.0, 10000.0, 10000.0, 10000.0],
+            "partial_rotary_factors": [0.5, 1.0, 1.0, 1.0],
+            "yarn_only_types": ["full_attention"],
+            "rope_scaling": {
+                "rope_type": "llama3",
+                "factor": 2.0,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 8192
+            }
+        }
+    }"#;
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.rope_llama3_factor, 2.0);
+    assert_eq!(cfg.rope_llama3_low_freq_factor, 1.0);
+    assert_eq!(cfg.rope_llama3_high_freq_factor, 4.0);
+    assert_eq!(cfg.rope_llama3_original_max_position, 8192);
+    assert!(cfg.rope_llama3_full_attention_only);
+    // The per-layer theta array must still be intact (llama3 scaling is
+    // applied on TOP of these, only for full-attention layers).
+    assert_eq!(cfg.rope_theta_per_layer[0], 5_000_000.0);
+    assert_eq!(cfg.layer_type(0), LayerType::FullAttention);
+    assert_eq!(cfg.layer_type(1), LayerType::SlidingAttention);
+}

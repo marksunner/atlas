@@ -206,6 +206,7 @@ pub fn verify_pick_all_with_pipeline(
     if fast_greedy_grammar_enabled()
         && a.grammar_state.is_some()
         && !a.inside_thinking
+        && a.remaining >= crate::scheduler::logit_processors::forced_close::forced_close_threshold()
         && (a.temperature == 0.0 || force_temp_zero_enabled())
         && a.repetition_penalty == 1.0
         && a.presence_penalty == 0.0

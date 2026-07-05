@@ -14,6 +14,7 @@ qwen3_6_moe = "qwen3_coder"    # Qwen3.6-35B — same XML format; MRoPE-interlea
 nemotron_h  = "qwen3_coder"    # Nemotron-H 30B — native XML format
 qwen3_next  = "hermes"        # Qwen3-Next-80B
 qwen3_vl_moe = "hermes"       # Qwen3-VL-30B
+step3p7     = "hermes"        # Step 3.7 Flash — Hermes JSON tool-call format
 mistral     = "mistral"       # Mistral Small 4 — native [TOOL_CALLS]name[ARGS]{json}
 gemma4      = "gemma4"        # Gemma-4 — native format: <|tool_call>call:name{...}<tool_call|>
 minimax_m2  = "minimax_xml"    # MiniMax M2 — <minimax:tool_call><invoke name=""><parameter name="">...
@@ -38,5 +39,6 @@ qwen3_6_moe = "qwen"
 nemotron_h  = "deepseek_r1"    # Nemotron-H ships the nano_v3 (DeepSeek-R1) parser
 qwen3_next  = "qwen"
 qwen3_vl_moe = "qwen"
+step3p7     = "qwen"
 mistral     = "mistral"
 minimax_m2  = "minimax"        # MiniMax M2/M2.7 — <think>...</think>, own identity

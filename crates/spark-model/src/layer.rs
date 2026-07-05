@@ -102,6 +102,19 @@ pub struct AttnMetadataDev {
     pub max_blocks_per_seq: u32,
     /// Number of sequences in this batch (1 for single-sequence decode).
     pub num_seqs: u32,
+    /// Sliding split pool: slot mappings `[N]` i64 computed against the
+    /// per-sequence sliding RING tables (block IDs in the SLIDING ID
+    /// space). NULL (DevicePtr(0)) when the split pool is off — sliding
+    /// layers then share `slot`/`block_table` like every other layer.
+    /// When the split pool is ON, sliding layers swap these in via
+    /// `Qwen3AttentionLayer::meta_for_layer`; a NULL here on that path is
+    /// a wiring bug and fails loudly there instead of corrupting memory.
+    pub sliding_slot: DevicePtr,
+    /// Sliding split pool: ring-expanded block tables
+    /// `[N * max_blocks_per_seq]` i32 (row `s`, entry `i` = `ring_s[i % R]`),
+    /// same row stride as `block_table` so kernels are oblivious to the
+    /// ring. NULL when the split pool is off.
+    pub sliding_block_table: DevicePtr,
 }
 
 /// Q12 batched-prefill device-side metadata.

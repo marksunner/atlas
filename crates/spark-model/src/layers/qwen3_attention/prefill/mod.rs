@@ -12,6 +12,7 @@
 //! beyond this wave's scope.
 
 mod cache_skip;
+mod cache_skip_flash;
 mod cache_skip_mla;
 mod cache_skip_qkv;
 mod paged;

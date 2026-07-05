@@ -33,6 +33,18 @@ fn decode_timing_record(copy_us: u64, sample_us: u64) {
     }
 }
 
+fn retain_tool_call_end_token(
+    tok: u32,
+    logprobs: Option<crate::api::TokenLogprobs>,
+    output_tokens: &mut Vec<u32>,
+    logprobs_data: &mut Vec<crate::api::TokenLogprobs>,
+) {
+    output_tokens.push(tok);
+    if let Some(lp) = logprobs {
+        logprobs_data.push(lp);
+    }
+}
+
 /// Sample and process decode logits for all active sequences.
 ///
 /// Factored out of `step_decode_only` so that `mixed_forward` can reuse
@@ -154,6 +166,20 @@ pub fn process_decode_logits(
         let a = &mut active[i];
         a.last_token = tok;
         a.last_token_time = now;
+
+        // Cooperative cancellation from the streaming pipeline (loop
+        // watchdogs, F4 SimHash guard, param-leak kill). emit_step.rs has
+        // the same check, but this plain decode path never calls
+        // emit_token — without the check here a fired stream guard only
+        // suppressed output while decode kept running to max_tokens
+        // (observed 2026-07-04: SimHash fired at ~700 tokens, decode ran
+        // to 5915). Uses `continue` (loop body), not `return`.
+        if let Some(ref f) = a.cancel_flag
+            && f.load(std::sync::atomic::Ordering::Acquire)
+        {
+            a.finished = true;
+            continue;
+        }
 
         // Fix B (2026-06-05, kill-switch): <tool_response> hard stop. This decode
         // path has no `<|im_start|>` hard-stop block (that lives only in
@@ -297,6 +323,17 @@ pub fn process_decode_logits(
             // `model` is threaded through so a watchdog rollback can
             // restore SSM recurrent state on hybrid models (Phase-C).
             handle_content_token(a, model);
+            // A watchdog fallback above may have ended the response after
+            // pushing a synthetic EOS (content-loop cut → finish="stop").
+            // Skip retaining/streaming the current loop token: appending it
+            // after the pushed EOS made `finish_sequence` see last≠EOS and
+            // report "length" — which agent clients (Hermes) answer with a
+            // continuation of the very loop that was just cut (observed
+            // live 2026-07-04 19:18: `rollback declined, reason=CapReached`
+            // → Done (length)).
+            if a.finished {
+                continue;
+            }
         }
 
         // Track <tool_call> token: once seen, legacy tool call requirement is satisfied.
@@ -323,16 +360,11 @@ pub fn process_decode_logits(
             a.require_tool_call = false;
         }
 
-        // Accumulate logprobs data for blocking responses.
-        if let Some(lp) = logprobs {
-            a.logprobs_data.push(lp);
-        }
-
         // </tool_call> stop: in legacy mode (no grammar), stop after first tool call.
         // When grammar is active, allow the model to generate multiple tool calls —
         // the grammar controls when EOS is valid.
         if tool_call_end_token == Some(tok) && !a.inside_thinking {
-            a.output_tokens.push(tok);
+            retain_tool_call_end_token(tok, logprobs, &mut a.output_tokens, &mut a.logprobs_data);
             // Fix A (2026-06-05): mark the tool call complete so the EOS-escape
             // gate (below) can lift suppression. Inert unless
             // `tool_eos_escape_enabled()` (default OFF).
@@ -451,159 +483,208 @@ pub fn process_decode_logits(
             || thinking_suppresses_eos
             || post_think_suppresses_eos;
 
-        if a.eos_tokens.contains(&tok) && !suppress_eos {
-            // Stop/EOS token: do NOT stream to client (OpenAI spec: returned text
-            // must not contain the stop sequence). The token is still added to
-            // output_tokens for correct token count; the API layer strips the
-            // decoded text for blocking responses.
-            a.output_tokens.push(tok);
-            crate::scheduler::emit_step::update_tool_param_state(a, tok);
-            a.finished = true;
-        } else if a.eos_tokens.contains(&tok) && suppress_eos {
-            // EOS suppressed: grammar not terminated or legacy tool call not yet seen.
-            // Don't stop, don't stream the EOS — the model must keep generating.
-            // Don't add to output_tokens (EOS is discarded).
-        } else {
-            a.output_tokens.push(tok);
-            // SM1 (2026-05-26): drive the tool-body / parameter-body
-            // state machine from the non-spec decode path. Previously
-            // only spec/verify paths called this (via emit_token),
-            // leaving every dependent gate (close-tag mask, AM1, B1,
-            // A1) silently dead under `mtp=false`.
-            crate::scheduler::emit_step::update_tool_param_state(a, tok);
-            // Phase-C: if this committed token is a content-phase
-            // boundary token (sentence end / newline) and the model is
-            // hybrid (attention + SSM), snapshot the recurrent SSM
-            // state now so a later watchdog rollback to this boundary
-            // can also rewind h_state/conv_state — not just the KV
-            // cache. Gated to content tokens because the watchdogs that
-            // roll back all fire post-`</think>`, and `apply_rollback`
-            // requires every dropped token to be a content token. No-op
-            // for pure-attention models / disabled rings (see
-            // `rollback::snapshot_boundary_if_ssm`).
-            if !a.inside_thinking {
-                rollback::snapshot_boundary_if_ssm(a, model);
-                // #155 iter3: block-aligned Marconi checkpoint on the
-                // non-MTP decode path (live SSM state is canonical here).
-                model.decode_marconi_checkpoint(&mut a.seq);
+        match crate::scheduler::emit_step::retain_token_after_eos_decision(
+            tok,
+            logprobs,
+            &a.eos_tokens,
+            suppress_eos,
+            &mut a.output_tokens,
+            &mut a.logprobs_data,
+        ) {
+            crate::scheduler::emit_step::EmitRetention::StoppingEos => {
+                // Stop/EOS token: do NOT stream to client (OpenAI spec: returned text
+                // must not contain the stop sequence). The token is still added to
+                // output_tokens for correct token count; the API layer strips the
+                // decoded text for blocking responses.
+                crate::scheduler::emit_step::update_tool_param_state(a, tok);
+                a.finished = true;
             }
-            // OPENCODE FIX: when the model spontaneously emits `<think>` even
-            // though the request didn't ask for thinking (`enable_thinking=false`),
-            // the `<think>` open token itself is suppressed (line ~1356), but
-            // the thinking-content tokens that follow MUST also be kept off the
-            // wire — otherwise opencode persists them as `assistant.content` and
-            // on the next turn the model sees its own past garbage (fake
-            // `<function=…>`, fake `<tool_response>`) as a "format example" and
-            // continues the pattern. Tokens stay in `output_tokens` for the
-            // blocking response path's reasoning_content extraction.
-            let suppress_stream = a.inside_thinking && !a.enable_thinking;
-            if let ResponseSink::Streaming(ref tx) = a.sink
-                && !suppress_stream
-            {
-                let event = if let Some(lp) = a.logprobs_data.last().cloned() {
-                    StreamEvent::TokenWithLogprobs(tok, lp)
-                } else {
-                    StreamEvent::Token(tok)
-                };
-                match tx.try_send(event) {
-                    Ok(()) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        tracing::debug!(
-                            "Streaming receiver dropped (decode_logits), finishing seq"
-                        );
-                        a.finished = true;
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
-                        if let Err(e) = tx.blocking_send(event) {
-                            tracing::error!(
-                                "Streaming send failed during backpressure (decode_logits): {e}"
+            crate::scheduler::emit_step::EmitRetention::SuppressedEos => {
+                // EOS suppressed: grammar not terminated or legacy tool call not yet seen.
+                // Don't stop, don't stream the EOS — the model must keep generating.
+                // Don't add to output_tokens/logprobs_data (EOS is discarded).
+            }
+            crate::scheduler::emit_step::EmitRetention::Retained => {
+                // SM1 (2026-05-26): drive the tool-body / parameter-body
+                // state machine from the non-spec decode path. Previously
+                // only spec/verify paths called this (via emit_token),
+                // leaving every dependent gate (close-tag mask, AM1, B1,
+                // A1) silently dead under `mtp=false`.
+                crate::scheduler::emit_step::update_tool_param_state(a, tok);
+                // Phase-C: if this committed token is a content-phase
+                // boundary token (sentence end / newline) and the model is
+                // hybrid (attention + SSM), snapshot the recurrent SSM
+                // state now so a later watchdog rollback to this boundary
+                // can also rewind h_state/conv_state — not just the KV
+                // cache. Gated to content tokens because the watchdogs that
+                // roll back all fire post-`</think>`, and `apply_rollback`
+                // requires every dropped token to be a content token. No-op
+                // for pure-attention models / disabled rings (see
+                // `rollback::snapshot_boundary_if_ssm`).
+                if !a.inside_thinking {
+                    rollback::snapshot_boundary_if_ssm(a, model);
+                    // #155 iter3: block-aligned Marconi checkpoint on the
+                    // non-MTP decode path (live SSM state is canonical here).
+                    model.decode_marconi_checkpoint(&mut a.seq);
+                }
+                // OPENCODE FIX: when the model spontaneously emits `<think>` even
+                // though the request didn't ask for thinking (`enable_thinking=false`),
+                // the `<think>` open token itself is suppressed (line ~1356), but
+                // the thinking-content tokens that follow MUST also be kept off the
+                // wire — otherwise opencode persists them as `assistant.content` and
+                // on the next turn the model sees its own past garbage (fake
+                // `<function=…>`, fake `<tool_response>`) as a "format example" and
+                // continues the pattern. Tokens stay in `output_tokens` for the
+                // blocking response path's reasoning_content extraction.
+                let suppress_stream = a.inside_thinking && !a.enable_thinking;
+                if let ResponseSink::Streaming(ref tx) = a.sink
+                    && !suppress_stream
+                {
+                    let event = if let Some(lp) = a.logprobs_data.last().cloned() {
+                        StreamEvent::TokenWithLogprobs(tok, lp)
+                    } else {
+                        StreamEvent::Token(tok)
+                    };
+                    match tx.try_send(event) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            tracing::debug!(
+                                "Streaming receiver dropped (decode_logits), finishing seq"
                             );
+                            a.finished = true;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                            if let Err(e) = tx.blocking_send(event) {
+                                tracing::error!(
+                                    "Streaming send failed during backpressure (decode_logits): {e}"
+                                );
+                                a.finished = true;
+                            }
+                        }
+                    }
+                }
+                if a.remaining == 0 {
+                    tracing::info!(
+                        "process_decode_logits: remaining=0, output_tokens={}, thinking_tokens={}",
+                        a.output_tokens.len(),
+                        a.thinking_tokens
+                    );
+                    a.finished = true;
+                }
+                // Grammar termination = end of sequence. With `stop_after_first=true`
+                // (tool_choice="required"), the structural-tag matcher transitions
+                // to its terminal state right after the single tool call closes.
+                // The model's free distribution past that point can be degenerate
+                // (Nemotron-Super-120B emits a `</parameter>` loop and never
+                // samples EOS naturally). Finish here instead of letting it run.
+                if a.grammar_state
+                    .as_ref()
+                    .is_some_and(|gs| gs.is_terminated())
+                {
+                    a.finished = true;
+                }
+
+                // Intra-response fuzzy repetition detection: if the last 2*W tokens
+                // approximately match the same W-token pattern, the model is looping.
+                // Uses Hamming distance with ~12% tolerance to catch loops where the
+                // model narrates the same plan with slight wording variations.
+                // Skip during tool calls: XML parameter tags have natural repetition
+                // (<parameter=..>...</parameter>) that triggers false positives.
+                // Use last occurrence positions — completed tool calls shouldn't
+                // disable the detector for subsequent text generation.
+                let last_tc_start = a
+                    .tool_call_start_token
+                    .and_then(|t| a.output_tokens.iter().rposition(|&tok| tok == t));
+                let last_tc_end = a
+                    .tool_call_end_token
+                    .and_then(|t| a.output_tokens.iter().rposition(|&tok| tok == t));
+                let inside_tool_call = match (last_tc_start, last_tc_end) {
+                    (Some(start), Some(end)) => start > end,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if enable_loop_watchdog()
+                    && !a.finished
+                    && !a.inside_thinking
+                    && !inside_tool_call
+                    && let Some((pattern_len, mis_a, mis_b)) =
+                        detect_fuzzy_repetition(&a.output_tokens)
+                {
+                    // Phase-C: roll back past the repeated window and
+                    // re-steer. `min_keep` = pattern_len * 3 guarantees all
+                    // three near-copies of the detected pattern are dropped
+                    // so generation cannot resume straight back into the
+                    // loop. Falls back to the hard stop when declined.
+                    let min_keep = pattern_len * 3;
+                    match rollback_to_boundary(a, min_keep, model) {
+                        RollbackOutcome::RolledBack { dropped } => {
+                            tracing::warn!(
+                                pattern_len,
+                                mismatches = mis_a + mis_b,
+                                dropped,
+                                rollback = a.rollback_count,
+                                "Fuzzy repetition detected; rolled back to boundary, re-steering"
+                            );
+                        }
+                        RollbackOutcome::Fallback(reason) => {
+                            tracing::warn!(
+                                "Fuzzy repetition: {pattern_len}-tok pattern x3 ({mis_a}+{mis_b} \
+                             mismatches), stopping at {} tokens (rollback declined: {reason:?})",
+                                a.output_tokens.len()
+                            );
+                            // Push an EOS so finish_sequence reports "stop",
+                            // not "length" — see decode_logits_content.rs
+                            // content-loop fallback for rationale.
+                            if let Some(&eos) = a.eos_tokens.first() {
+                                a.output_tokens.push(eos);
+                            }
                             a.finished = true;
                         }
                     }
                 }
-            }
-            if a.remaining == 0 {
-                tracing::info!(
-                    "process_decode_logits: remaining=0, output_tokens={}, thinking_tokens={}",
-                    a.output_tokens.len(),
-                    a.thinking_tokens
-                );
-                a.finished = true;
-            }
-            // Grammar termination = end of sequence. With `stop_after_first=true`
-            // (tool_choice="required"), the structural-tag matcher transitions
-            // to its terminal state right after the single tool call closes.
-            // The model's free distribution past that point can be degenerate
-            // (Nemotron-Super-120B emits a `</parameter>` loop and never
-            // samples EOS naturally). Finish here instead of letting it run.
-            if a.grammar_state
-                .as_ref()
-                .is_some_and(|gs| gs.is_terminated())
-            {
-                a.finished = true;
-            }
 
-            // Intra-response fuzzy repetition detection: if the last 2*W tokens
-            // approximately match the same W-token pattern, the model is looping.
-            // Uses Hamming distance with ~12% tolerance to catch loops where the
-            // model narrates the same plan with slight wording variations.
-            // Skip during tool calls: XML parameter tags have natural repetition
-            // (<parameter=..>...</parameter>) that triggers false positives.
-            // Use last occurrence positions — completed tool calls shouldn't
-            // disable the detector for subsequent text generation.
-            let last_tc_start = a
-                .tool_call_start_token
-                .and_then(|t| a.output_tokens.iter().rposition(|&tok| tok == t));
-            let last_tc_end = a
-                .tool_call_end_token
-                .and_then(|t| a.output_tokens.iter().rposition(|&tok| tok == t));
-            let inside_tool_call = match (last_tc_start, last_tc_end) {
-                (Some(start), Some(end)) => start > end,
-                (Some(_), None) => true,
-                _ => false,
-            };
-            if enable_loop_watchdog()
-                && !a.finished
-                && !a.inside_thinking
-                && !inside_tool_call
-                && let Some((pattern_len, mis_a, mis_b)) = detect_fuzzy_repetition(&a.output_tokens)
-            {
-                // Phase-C: roll back past the repeated window and
-                // re-steer. `min_keep` = pattern_len * 3 guarantees all
-                // three near-copies of the detected pattern are dropped
-                // so generation cannot resume straight back into the
-                // loop. Falls back to the hard stop when declined.
-                let min_keep = pattern_len * 3;
-                match rollback_to_boundary(a, min_keep, model) {
-                    RollbackOutcome::RolledBack { dropped } => {
-                        tracing::warn!(
-                            pattern_len,
-                            mismatches = mis_a + mis_b,
-                            dropped,
-                            rollback = a.rollback_count,
-                            "Fuzzy repetition detected; rolled back to boundary, re-steering"
-                        );
-                    }
-                    RollbackOutcome::Fallback(reason) => {
-                        tracing::warn!(
-                            "Fuzzy repetition: {pattern_len}-tok pattern x3 ({mis_a}+{mis_b} \
-                             mismatches), stopping at {} tokens (rollback declined: {reason:?})",
-                            a.output_tokens.len()
-                        );
-                        a.finished = true;
-                    }
+                // Check request timeout.
+                if !a.finished
+                    && let Some(deadline) = a.timeout_at
+                    && Instant::now() >= deadline
+                {
+                    tracing::warn!("Request timeout after {:?}", a.request_start.elapsed());
+                    a.finished = true;
                 }
             }
-
-            // Check request timeout.
-            if !a.finished
-                && let Some(deadline) = a.timeout_at
-                && Instant::now() >= deadline
-            {
-                tracing::warn!("Request timeout after {:?}", a.request_start.elapsed());
-                a.finished = true;
-            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_call_end_logprobs_tests {
+    use super::retain_tool_call_end_token;
+
+    fn lp(tok: u32, logprob: f32) -> crate::api::TokenLogprobs {
+        crate::api::TokenLogprobs {
+            token_id: tok,
+            logprob,
+            top: vec![(tok, logprob)],
+        }
+    }
+
+    #[test]
+    fn tool_call_end_retains_current_logprobs_before_streaming_lookup() {
+        let tool_call_end = 151657u32;
+        let mut output_tokens = vec![42];
+        let mut logprobs_data = vec![lp(42, -0.42)];
+
+        retain_tool_call_end_token(
+            tool_call_end,
+            Some(lp(tool_call_end, -0.01)),
+            &mut output_tokens,
+            &mut logprobs_data,
+        );
+
+        assert_eq!(output_tokens, vec![42, tool_call_end]);
+        assert_eq!(logprobs_data.len(), output_tokens.len());
+        let last = logprobs_data.last().unwrap();
+        assert_eq!(last.token_id, tool_call_end);
+        assert!((last.logprob + 0.01).abs() < f32::EPSILON);
     }
 }

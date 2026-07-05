@@ -30,6 +30,9 @@ fn test_config() -> KvCacheConfig {
         layer_dtypes: vec![],
         layer_dims: vec![],
         cache_blocks_per_seq: None,
+        layer_sliding: Vec::new(),
+        num_sliding_blocks: 0,
+        sliding_ring_blocks: 0,
     }
 }
 

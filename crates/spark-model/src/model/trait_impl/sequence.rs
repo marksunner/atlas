@@ -136,6 +136,9 @@ impl TransformerModel {
             self.kv_cache.lock().free_blocks(&seq.block_table);
             seq.block_table.clear();
         }
+        if !seq.sliding_block_table.is_empty() {
+            super::super::block_mgmt::free_sliding_ring(seq, &mut self.kv_cache.lock());
+        }
 
         // --high-speed-swap: release disk-side refs for every block this
         // sequence ever held (Phase 6.1.c). disk_block_ids are layer-
@@ -343,12 +346,30 @@ impl TransformerModel {
         let gpu = self.gpu.as_ref();
 
         // Phase 1: Copy all KV block data from GPU to host buffers under the lock.
+        //
+        // Split sliding pool: sliding layers are indexed by the sequence's
+        // ring IDs (their pools are only `num_sliding_blocks` long — a
+        // full-pool ID would read out of bounds there). Full-attention
+        // layers keep the legacy block_table walk; the sliding section is
+        // appended after it. With the split pool off, the sliding vec is
+        // empty and the layout is byte-identical to the legacy format.
         let kv_buffers = {
             let kv = self.kv_cache.lock();
+            let split = kv.config().split_sliding_active();
             let mut bufs = Vec::with_capacity(seq.block_table.len() * kv.num_layers());
             for &block_idx in &seq.block_table {
                 for layer_idx in 0..kv.num_layers() {
+                    if split && kv.config().is_sliding_layer(layer_idx) {
+                        continue;
+                    }
                     bufs.push(kv.read_block(layer_idx, block_idx, gpu)?);
+                }
+            }
+            for &ring_idx in &seq.sliding_block_table {
+                for layer_idx in 0..kv.num_layers() {
+                    if kv.config().is_sliding_layer(layer_idx) {
+                        bufs.push(kv.read_block(layer_idx, ring_idx, gpu)?);
+                    }
                 }
             }
             bufs
@@ -390,22 +411,46 @@ impl TransformerModel {
         let gpu = self.gpu.as_ref();
 
         // Phase 1: Read all KV block data from disk into host buffers.
-        let (num_layers, layer_strides) = {
+        // Mirrors the save layout: full-layer section (block_table ×
+        // non-sliding layers), then the sliding ring section. Ring length
+        // is derived the same way on both sides: min(R, num_blocks).
+        let (num_layers, layer_strides, split, sliding_flags, ring_len) = {
             let kv = self.kv_cache.lock();
             let n = kv.num_layers();
             let strides: Vec<usize> = (0..n).map(|i| kv.block_stride_bytes_for_layer(i)).collect();
-            (n, strides)
+            let split = kv.config().split_sliding_active();
+            let flags: Vec<bool> = (0..n).map(|i| kv.config().is_sliding_layer(i)).collect();
+            let r = kv.sliding_ring_blocks();
+            let ring_len = if split { num_blocks.min(r) } else { 0 };
+            (n, strides, split, flags, ring_len)
         };
 
         let mut kv_buffers = Vec::with_capacity(num_blocks * num_layers);
         for _ in 0..num_blocks {
             for layer_idx in 0..num_layers {
+                if split && sliding_flags[layer_idx] {
+                    continue;
+                }
                 let stride = layer_strides[layer_idx];
                 let mut k_data = vec![0u8; stride];
                 let mut v_data = vec![0u8; stride];
                 reader.read_exact(&mut k_data)?;
                 reader.read_exact(&mut v_data)?;
                 kv_buffers.push((k_data, v_data));
+            }
+        }
+        let mut sliding_buffers = Vec::new();
+        for _ in 0..ring_len {
+            for layer_idx in 0..num_layers {
+                if !sliding_flags[layer_idx] {
+                    continue;
+                }
+                let stride = layer_strides[layer_idx];
+                let mut k_data = vec![0u8; stride];
+                let mut v_data = vec![0u8; stride];
+                reader.read_exact(&mut k_data)?;
+                reader.read_exact(&mut v_data)?;
+                sliding_buffers.push((k_data, v_data));
             }
         }
 
@@ -417,6 +462,9 @@ impl TransformerModel {
             for _ in 0..num_blocks {
                 let block_idx = kv.alloc_block()?;
                 for layer_idx in 0..num_layers {
+                    if split && sliding_flags[layer_idx] {
+                        continue;
+                    }
                     let (ref k_data, ref v_data) = kv_buffers[buf_idx];
                     kv.write_block(layer_idx, block_idx, k_data, v_data, gpu)?;
                     buf_idx += 1;
@@ -424,6 +472,22 @@ impl TransformerModel {
                 new_block_table.push(block_idx);
             }
             seq.block_table = new_block_table;
+
+            let mut new_ring = Vec::with_capacity(ring_len);
+            let mut sbuf_idx = 0;
+            for _ in 0..ring_len {
+                let ring_idx = kv.alloc_sliding_block()?;
+                for layer_idx in 0..num_layers {
+                    if !sliding_flags[layer_idx] {
+                        continue;
+                    }
+                    let (ref k_data, ref v_data) = sliding_buffers[sbuf_idx];
+                    kv.write_block(layer_idx, ring_idx, k_data, v_data, gpu)?;
+                    sbuf_idx += 1;
+                }
+                new_ring.push(ring_idx);
+            }
+            seq.sliding_block_table = new_ring;
         } // Lock released here.
 
         // Phase 3: Read SSM state data from disk and upload to GPU.

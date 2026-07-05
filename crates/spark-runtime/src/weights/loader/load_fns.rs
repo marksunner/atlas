@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::super::{WeightDtype, WeightTensor, evict_page_cache};
+use super::super::{EpShard, WeightDtype, WeightTensor, evict_page_cache};
 use super::{SafetensorsIndex, check_oom_guard, estimate_has_fp8, estimate_load_bytes};
 use crate::gpu::GpuBackend;
 
@@ -18,6 +18,7 @@ pub(super) fn load_sharded(
     oom_reserve_bytes: usize,
     skip_fn: &dyn Fn(&str) -> bool,
     peak_multiplier_override: Option<f64>,
+    ep: EpShard,
 ) -> Result<HashMap<String, WeightTensor>> {
     let index_json = std::fs::read_to_string(index_path)
         .with_context(|| format!("Failed to read {}", index_path.display()))?;
@@ -37,8 +38,8 @@ pub(super) fn load_sharded(
     // Pre-flight: estimate bytes from index with model-building overhead.
     let shard_files: Vec<std::path::PathBuf> =
         shard_to_tensors.keys().map(|s| model_dir.join(s)).collect();
-    let estimated = estimate_load_bytes(&shard_files, skip_fn)?;
-    let has_fp8 = estimate_has_fp8(&shard_files, skip_fn)?;
+    let estimated = estimate_load_bytes(&shard_files, skip_fn, ep)?;
+    let has_fp8 = estimate_has_fp8(&shard_files, skip_fn, ep)?;
     let overhead_multiplier: f64 =
         peak_multiplier_override.unwrap_or(if has_fp8 { 1.5 } else { 1.3 });
     let peak_estimated = (estimated as f64 * overhead_multiplier) as usize;
@@ -100,8 +101,12 @@ pub(super) fn load_sharded(
             }
             let view = tensors.tensor(name)?;
             let dtype = WeightDtype::from_safetensors(view.dtype())?;
-            let shape: Vec<usize> = view.shape().to_vec();
-            let data = view.data();
+            let full_shape: Vec<usize> = view.shape().to_vec();
+            let full_data = view.data();
+            let (data, shape) = match ep.fused_slice(name, &full_shape, full_data.len()) {
+                Some((off, len, local_shape)) => (&full_data[off..off + len], local_shape),
+                None => (full_data, full_shape),
+            };
 
             // Try GPU alloc first; if OOM, fall back to managed (UVM) memory.
             // On GB10 unified memory, managed alloc uses Linux swap for overflow.
@@ -170,6 +175,7 @@ pub(super) fn load_single(
     gpu: &dyn GpuBackend,
     oom_reserve_bytes: usize,
     skip_fn: &dyn Fn(&str) -> bool,
+    ep: EpShard,
 ) -> Result<HashMap<String, WeightTensor>> {
     let file = std::fs::File::open(path)?;
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
@@ -181,8 +187,12 @@ pub(super) fn load_single(
             continue;
         }
         let dtype = WeightDtype::from_safetensors(view.dtype())?;
-        let shape: Vec<usize> = view.shape().to_vec();
-        let data = view.data();
+        let full_shape: Vec<usize> = view.shape().to_vec();
+        let full_data = view.data();
+        let (data, shape) = match ep.fused_slice(&name, &full_shape, full_data.len()) {
+            Some((off, len, local_shape)) => (&full_data[off..off + len], local_shape),
+            None => (full_data, full_shape),
+        };
 
         let ptr = gpu.alloc(data.len())?;
         gpu.copy_h2d(data, ptr)?;
@@ -207,4 +217,71 @@ pub(super) fn load_single(
     )?;
 
     Ok(weights)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::mock::MockGpuBackend;
+    use std::io::Write;
+
+    fn write_u8_safetensor(tensors: &[(&str, &[usize], &[u8])]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "atlas-load-single-test-{}-{}.safetensors",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut header = serde_json::Map::new();
+        let mut offset = 0usize;
+        for (name, shape, data) in tensors {
+            assert_eq!(shape.iter().product::<usize>(), data.len());
+            header.insert(
+                (*name).to_string(),
+                serde_json::json!({
+                    "dtype": "U8",
+                    "shape": shape,
+                    "data_offsets": [offset, offset + data.len()],
+                }),
+            );
+            offset += data.len();
+        }
+        let header = serde_json::Value::Object(header).to_string();
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(header.as_bytes()).unwrap();
+        for (_, _, data) in tensors {
+            file.write_all(data).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn load_single_ep2_slices_fused_expert_tensors() {
+        let fused: Vec<u8> = (0..24).collect();
+        let replicated = [100, 101, 102, 103];
+        let path = write_u8_safetensor(&[
+            ("model.layers.0.moe.gate_proj.weight", &[4, 6], &fused),
+            ("model.embed_tokens.weight", &[4], &replicated),
+        ]);
+        let gpu = MockGpuBackend::new();
+        let skip = |_: &str| false;
+
+        let weights = load_single(&path, &gpu, 0, &skip, EpShard::from_parts(1, 2, 4)).unwrap();
+
+        let fused_weight = weights.get("model.layers.0.moe.gate_proj.weight").unwrap();
+        assert_eq!(fused_weight.shape, vec![2, 6]);
+        assert_eq!(
+            gpu.read_alloc(fused_weight.ptr).unwrap(),
+            (12..24).collect::<Vec<_>>()
+        );
+        let replicated_weight = weights.get("model.embed_tokens.weight").unwrap();
+        assert_eq!(replicated_weight.shape, vec![4]);
+        assert_eq!(gpu.read_alloc(replicated_weight.ptr).unwrap(), replicated);
+
+        std::fs::remove_file(path).unwrap();
+    }
 }

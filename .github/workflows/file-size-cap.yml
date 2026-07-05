@@ -49,11 +49,6 @@ jobs:
             # `prefill_b/`-style split family; the leftover is one long
             # function with too many local closures to extract cleanly.
             "crates/spark-model/src/model/trait_impl/prefill_c.rs"
-            # 507 LoC — single-token decode attention forward.
-            # Compute-heavy template (kernel-launch sequence + buffer
-            # ping-pong); splitting fragments the launch order, which is
-            # critical for CUDA graph capture correctness.
-            "crates/spark-model/src/layers/qwen3_attention/decode/attention_forward.rs"
             # 537 LoC — multi-sequence QKV projection orchestration.
             # Heavy stride/pointer arithmetic that's easier to audit in
             # one file than fragmented across siblings.
@@ -133,7 +128,6 @@ jobs:
             "crates/spark-model/src/layers/mtp_head/forward.rs"
             "crates/spark-model/src/layers/ops/gemm_quant.rs"
             "crates/spark-model/src/layers/ops/moe_expert.rs"
-            "crates/spark-model/src/layers/qwen3_attention/prefill/cache_skip.rs"
             "crates/spark-model/src/layers/qwen3_attention/prefill/paged.rs"
             "crates/spark-model/src/model/block_mgmt.rs"
             "crates/spark-model/src/model/impl_a2.rs"

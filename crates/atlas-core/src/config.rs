@@ -84,6 +84,16 @@ pub struct ModelConfig {
     /// uses 2.
     #[serde(default = "default_one")]
     pub decoder_sparse_step: usize,
+    /// Number of dense-FFN layers in an otherwise-MoE model (Step 3.7:
+    /// layers 0-2 are dense, 3-44 MoE). Dense layers run through the
+    /// SAME `expert_gate_out`/`expert_up_out` arena buffers as
+    /// `[M, intermediate_size]`, so buffer sizing must take
+    /// `max(top_k × moe_intermediate_size, intermediate_size)` when this
+    /// is non-zero. 0 (default) = no dense layers in a MoE model, or a
+    /// pure-dense model (where `num_experts == 0` already selects the
+    /// dense sizing). Parser-populated; not an HF config field.
+    #[serde(skip)]
+    pub num_dense_ffn_layers: usize,
 
     // ── Hybrid layer layout ──
     /// Per-layer kind (FullAttention | LinearAttention | …) parsed from
@@ -108,6 +118,53 @@ pub struct ModelConfig {
     pub max_position_embeddings: usize,
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
+    /// Per-layer RoPE theta for models whose config ships `rope_theta`
+    /// as an array (Step 3.7: 5e6 on full-attention layers, 1e4 on
+    /// sliding). Empty for single-theta models; indexed by layer, same
+    /// truncation as `layer_types`. vLLM equivalent: `Step3p5Attention`
+    /// `rope_theta = rope_theta[self.layer_idx]`.
+    #[serde(skip)]
+    pub rope_theta_per_layer: Vec<f64>,
+    /// Per-layer partial rotary factors (Step 3.7: 0.5 on full-attention
+    /// layers → rotary_dim 64, 1.0 on sliding → 128). Empty for models
+    /// with a single scalar `partial_rotary_factor`. vLLM equivalent:
+    /// `partial_rotary_factor = partial_rotary_factors[layer_idx]`.
+    #[serde(skip)]
+    pub partial_rotary_factors: Vec<f64>,
+    /// Per-layer SwiGLU clamp limits for ROUTED experts (Step 3.7: 7.0 on
+    /// layers 43/44, 0 elsewhere; 0 = no clamp). vLLM equivalent: the
+    /// `swiglustep` fused-MoE activation selected from `swiglu_limits`.
+    #[serde(skip)]
+    pub swiglu_limits: Vec<f64>,
+    /// Per-layer SwiGLU clamp limits for the SHARED-expert / dense MLP path
+    /// (Step 3.7: 16.0 on layers 43/44). vLLM equivalent: `SwigluStepAndMul`
+    /// selected from `swiglu_limits_shared`.
+    #[serde(skip)]
+    pub swiglu_limits_shared: Vec<f64>,
+    /// Llama-3.1 "llama3" RoPE frequency scaling. When
+    /// `rope_llama3_factor > 0`, the NTK-by-parts frequency transform is
+    /// applied to the RoPE inv_freq table (low-frequency pairs divided by
+    /// `factor`, high-frequency pairs unchanged, medium interpolated).
+    /// Step 3.7 ships `rope_scaling = {"rope_type":"llama3","factor":2.0,
+    /// "low_freq_factor":1.0,"high_freq_factor":4.0,
+    /// "original_max_position_embeddings":8192}` and restricts it to
+    /// full-attention layers via `yarn_only_types: ["full_attention"]`.
+    /// Without this, full-attention (long-range retrieval) layers rotate
+    /// too fast beyond `original_max_position_embeddings`, degrading
+    /// long-context content generation. 0.0 = disabled.
+    #[serde(skip)]
+    pub rope_llama3_factor: f64,
+    #[serde(skip)]
+    pub rope_llama3_low_freq_factor: f64,
+    #[serde(skip)]
+    pub rope_llama3_high_freq_factor: f64,
+    #[serde(skip)]
+    pub rope_llama3_original_max_position: usize,
+    /// When true, llama3 scaling applies ONLY to full-attention layers
+    /// (Step 3.7 `yarn_only_types: ["full_attention"]`). When false, it
+    /// applies to every layer.
+    #[serde(skip)]
+    pub rope_llama3_full_attention_only: bool,
 
     // ── Normalization ──
     #[serde(default = "default_rms_eps")]

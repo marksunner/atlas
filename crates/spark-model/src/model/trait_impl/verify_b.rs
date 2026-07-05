@@ -42,6 +42,16 @@ impl TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<[u32; 2]> {
+
+        // Sliding split pool: speculative verify metadata has no sliding
+        // twin — the factory refuses spec+split configs at startup, so
+        // reaching this under the split pool is a wiring bug. Bail before
+        // any KV write can route a full-pool slot into a sliding pool.
+        if self.sliding_ring_len() > 0 {
+            anyhow::bail!(
+                "speculative verify is not supported with the sliding-window KV split                  pool (disable speculative decoding or set ATLAS_NO_SLIDING_KV_SPLIT=1)"
+            );
+        }
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
         let bf16 = 2usize;
@@ -146,6 +156,13 @@ impl TransformerModel {
             block_table: meta_base.offset(768),
             max_blocks_per_seq: max_blocks,
             num_seqs: k as u32,
+            // Speculative verify is refused at model build time when the
+            // sliding split pool is active (see factory/build.rs), so the
+            // sliding twin is never needed here. NULL sentinels make any
+            // future misuse fail loudly in meta_for_layer instead of
+            // writing through a full-pool ID into a small sliding pool.
+            sliding_slot: DevicePtr(0),
+            sliding_block_table: DevicePtr(0),
         };
 
         // CUDA graphs cannot capture NCCL all-reduce (disabled for EP).

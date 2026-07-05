@@ -363,3 +363,136 @@ fn test_forced_token_none_on_genuine_choice() {
         "a two-way choice must not be reported as forced",
     );
 }
+
+// ── Budget-aware forced close ------------------------------------------------
+
+fn ascii_json(tokens: &[u32]) -> String {
+    tokens
+        .iter()
+        .filter_map(|&t| (t < 128).then_some(t as u8 as char))
+        .collect()
+}
+
+#[test]
+fn test_forced_close_basic_closes_parseable_json() {
+    let vocab = test_vocab();
+    let stop_ids = vec![130i32];
+    let mut engine = GrammarEngine::new(&vocab, &stop_ids).unwrap();
+
+    let schema = r#"{
+        "type": "object",
+        "properties": { "name": { "type": "string" } },
+        "required": ["name"]
+    }"#;
+    let compiled = engine.compile_json_schema(schema).unwrap();
+    let mut state = GrammarState::new(&compiled, engine.vocab_size())
+        .unwrap()
+        .with_stop_tokens(&[130]);
+    let mut out: Vec<u32> = br#"{"name":"abc"#.iter().map(|&b| b as u32).collect();
+    for &tok in &out {
+        assert!(
+            state.accept_token(tok),
+            "prefix token must be grammar-legal"
+        );
+    }
+
+    for _ in 0..16 {
+        if state.is_terminated() {
+            break;
+        }
+        let tok = state
+            .forced_close_token()
+            .expect("partial JSON must have a legal close token");
+        assert!(
+            state.accept_token(tok),
+            "forced-close token must be accepted"
+        );
+        if tok != 130 {
+            out.push(tok);
+        }
+    }
+
+    assert!(
+        state.is_terminated(),
+        "forced close should drive the matcher to termination"
+    );
+    let text = ascii_json(&out);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).expect("forced-close output must parse as JSON");
+    assert_eq!(parsed["name"], "abc");
+}
+
+#[test]
+fn test_forced_close_mtp_speculative_rollback_restores_matcher() {
+    let vocab = test_vocab();
+    let stop_ids = vec![130i32];
+    let mut engine = GrammarEngine::new(&vocab, &stop_ids).unwrap();
+    let compiled = engine.compile_json_grammar().unwrap();
+    let mut state = GrammarState::new(&compiled, engine.vocab_size()).unwrap();
+
+    for &tok in br#"["abc"# {
+        assert!(state.accept_token(tok as u32));
+    }
+    let before_steps = state.num_history_steps();
+    let before_pick = state
+        .forced_close_token()
+        .expect("unterminated string should force a close candidate");
+
+    assert!(state.accept_token(before_pick));
+    let advanced = state.num_history_steps().saturating_sub(before_steps);
+    state.rollback(advanced);
+
+    assert_eq!(state.num_history_steps(), before_steps);
+    let after_pick = state
+        .forced_close_token()
+        .expect("rollback must restore legal close candidate");
+    assert_eq!(
+        after_pick, before_pick,
+        "MTP rejection rollback must keep grammar matcher state in sync"
+    );
+}
+
+#[test]
+fn test_forced_close_rollback_after_rejected_speculation_keeps_next_close_valid() {
+    let vocab = test_vocab();
+    let stop_ids = vec![130i32];
+    let mut engine = GrammarEngine::new(&vocab, &stop_ids).unwrap();
+    let compiled = engine.compile_json_grammar().unwrap();
+    let mut state = GrammarState::new(&compiled, engine.vocab_size()).unwrap();
+
+    for &tok in br#"{"a":"b"# {
+        assert!(state.accept_token(tok as u32));
+    }
+    let base_steps = state.num_history_steps();
+    let quote = state.forced_close_token().expect("string close is legal");
+    assert_eq!(quote, b'"' as u32);
+    assert!(state.accept_token(quote));
+    let brace = state
+        .forced_close_token()
+        .expect("object close is legal after string close");
+    assert_eq!(brace, b'}' as u32);
+    assert!(state.accept_token(brace));
+
+    let advanced = state.num_history_steps().saturating_sub(base_steps);
+    state.rollback(advanced);
+
+    assert_eq!(state.num_history_steps(), base_steps);
+    assert_eq!(state.forced_close_token(), Some(b'"' as u32));
+}
+
+#[test]
+fn test_forced_close_empty_grammar_edge_returns_none() {
+    let vocab = test_vocab();
+    let stop_ids = vec![130i32];
+    let mut engine = GrammarEngine::new(&vocab, &stop_ids).unwrap();
+    let compiled = engine
+        .compile_ebnf(r#"root ::= "\xff""#, "root")
+        .expect("grammar compiles even though test vocab cannot emit byte 0xff");
+    let mut state = GrammarState::new(&compiled, engine.vocab_size()).unwrap();
+
+    assert_eq!(
+        state.forced_close_token(),
+        None,
+        "no legal token must return None instead of panicking"
+    );
+}

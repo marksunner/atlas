@@ -91,6 +91,14 @@ pub struct TransformerModel {
     pub(super) max_blocks_per_seq: u32,
     /// Permanent KV cache block for padding sequences in batched decode.
     pub(super) dummy_kv_block: u32,
+    /// Sliding split pool: permanent zeroed block in the SLIDING ID space
+    /// for OOB-safe padding of sliding block tables. 0 (and unused) when
+    /// the split pool is off.
+    pub(super) dummy_sliding_block: u32,
+    /// Sliding split pool: per-sequence ring length R, cached from
+    /// `KvCacheConfig::sliding_ring_blocks` so metadata builders don't
+    /// need the KV-cache lock. 0 = split pool off.
+    pub(super) sliding_split_ring: usize,
     /// Profile mode: skip graphs, sync+time each layer. Set ATLAS_PROFILE=1.
     pub(super) profile: bool,
     /// One-shot profile flag for the next prefill request only. Set

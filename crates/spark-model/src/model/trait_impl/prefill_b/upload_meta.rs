@@ -202,6 +202,26 @@ impl TransformerModel {
             self.gpu.copy_h2d_async(pinned_slice, meta_base, stream)?;
         }
 
+        // Sliding split pool, non-paged (chunk 0) path: host-build the
+        // sliding slot twin against the per-sequence ring and upload to
+        // the dedicated staging region (the paged path fills it on-device
+        // in `prefill_b_upload_paged` instead).
+        let ring_len = self.sliding_ring_len();
+        if ring_len > 0 && !needs_paged {
+            let bs = kv_cache.block_size();
+            let sliding_slots: Vec<i64> = (proc_start..proc_start + proc_count)
+                .map(|i| self.sliding_slot_for(seq, i, bs, ring_len))
+                .collect();
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    sliding_slots.as_ptr() as *const u8,
+                    sliding_slots.len() * 8,
+                )
+            };
+            self.gpu
+                .copy_h2d_async(bytes, self.sliding_prefill_slots_base(), stream)?;
+        }
+
         Ok(MetaLayout {
             meta_base,
             slot_offset,

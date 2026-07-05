@@ -56,6 +56,9 @@ impl MockModel {
             layer_dtypes: vec![],
             layer_dims: vec![],
             cache_blocks_per_seq: None,
+            layer_sliding: Vec::new(),
+            num_sliding_blocks: 0,
+            sliding_ring_blocks: 0,
         };
         let kv_cache = PagedKvCache::new(kv_config, 10, &gpu).unwrap();
 
@@ -159,6 +162,7 @@ impl Model for MockModel {
             prompt_len: 0,
             disk_block_ids: Vec::new(),
             disk_last_offloaded_per_layer: Vec::new(),
+            sliding_block_table: Vec::new(),
         })
     }
 

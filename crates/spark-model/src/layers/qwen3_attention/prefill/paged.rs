@@ -278,7 +278,12 @@ impl Qwen3AttentionLayer {
         // mode (batched_meta = None).
         let meta_for_single = match (batched_meta, ctx.attn_metadata) {
             (Some(_), _) => None,
-            (None, Some(m)) => Some(m),
+            // Sliding split pool: sliding layers swap in the ring twin
+            // (slot + block table in the sliding block-ID space) so the
+            // KV write (section 7) and paged attention (section 8) both
+            // address this layer's own pool. The batched path is gated
+            // off under the split pool (kernel_batched_eligible).
+            (None, Some(m)) => Some(self.meta_for_layer(&m, kv_cache)?),
             (None, None) => anyhow::bail!(
                 "prefill_attention_paged: single-stream mode requires ctx.attn_metadata"
             ),
@@ -375,6 +380,26 @@ impl Qwen3AttentionLayer {
                 hd,
                 self.rotary_dim_override
                     .unwrap_or(ctx.config.rotary_dim() as u32),
+                self.rope_theta_override
+                    .unwrap_or(ctx.config.rope_theta as f32),
+                stream,
+            )?;
+        } else if !self.rope_inv_freq_table.is_null() {
+            // llama3 (NTK-by-parts) RoPE: read frequencies from the
+            // precomputed per-layer table (Step 3.7 full-attention layers).
+            ops::rope_yarn(
+                ctx.gpu,
+                self.rope_yarn_k,
+                q_contiguous,
+                k_contiguous,
+                bmeta_positions,
+                n,
+                nq,
+                nkv,
+                hd,
+                self.rotary_dim_override
+                    .unwrap_or(ctx.config.rotary_dim() as u32),
+                self.rope_inv_freq_table,
                 self.rope_theta_override
                     .unwrap_or(ctx.config.rope_theta as f32),
                 stream,

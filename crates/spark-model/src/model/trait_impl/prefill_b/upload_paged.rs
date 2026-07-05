@@ -74,6 +74,72 @@ impl TransformerModel {
             stream,
         )?;
 
+        // Sliding split pool: upload the ring-expanded table delta and fill
+        // the sliding slot twin. The logical→ring mapping (`i % R`) never
+        // changes once assigned, so the append-only delta upload mirrors
+        // the full-pool one exactly; the same fill_slots kernel then
+        // derives per-token write slots from the sliding table.
+        let ring_len = self.sliding_ring_len();
+        if ring_len > 0 {
+            // STEP37-QUALITY Round 7: assert this chunk's write span plus its
+            // sliding-window lookback is alias-free in the ring — the exact
+            // property the ring size guarantees, checked against the same ring
+            // mapping the fill_slots kernel below indexes. No-op unless
+            // ATLAS_SLIDING_KV_VERIFY=1. This is the brief's suspect #1
+            // (chunk-1+ fill_slots staging); a size bug would fire here first.
+            let win = self.config.sliding_window as usize;
+            self.verify_sliding_no_alias(
+                seq,
+                proc_start.saturating_sub(win),
+                proc_start + proc_count,
+                bs,
+                ring_len,
+            )?;
+            let sliding_upload_start = seq
+                .chunked_prefill_meta
+                .as_ref()
+                .unwrap()
+                .uploaded_sliding_blocks;
+            if sliding_upload_start < current_blocks {
+                let entries: Vec<i32> = (sliding_upload_start..current_blocks)
+                    .map(|i| {
+                        seq.sliding_physical_block_for(i, ring_len)
+                            .unwrap_or(self.dummy_sliding_block) as i32
+                    })
+                    .collect();
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(entries.as_ptr() as *const u8, entries.len() * 4)
+                };
+                let sliding_bt_base = seq
+                    .chunked_prefill_meta
+                    .as_ref()
+                    .unwrap()
+                    .sliding_block_table;
+                self.gpu.copy_h2d_async(
+                    bytes,
+                    sliding_bt_base.offset(sliding_upload_start * std::mem::size_of::<u32>()),
+                    stream,
+                )?;
+                seq.chunked_prefill_meta
+                    .as_mut()
+                    .unwrap()
+                    .uploaded_sliding_blocks = current_blocks;
+            }
+            ops::fill_slots_from_block_table(
+                self.gpu.as_ref(),
+                self.fill_slots_kernel,
+                self.sliding_prefill_slots_base(),
+                seq.chunked_prefill_meta
+                    .as_ref()
+                    .unwrap()
+                    .sliding_block_table,
+                proc_start as u32,
+                proc_count as u32,
+                bs as u32,
+                stream,
+            )?;
+        }
+
         Ok(())
     }
 }

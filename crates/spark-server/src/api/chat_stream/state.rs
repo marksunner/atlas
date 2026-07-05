@@ -38,6 +38,12 @@ pub(super) struct StreamState {
     /// Flips true on first stop-string match or on watchdog/dedup
     /// trip; suppresses further content emissions.
     pub(super) stop_string_triggered: bool,
+    /// Set when the content-loop guard (F4 SimHash paraphrase detector
+    /// or the exact-line loop watchdog) ends the response. handle_done
+    /// reports `finish_reason="stop"` for this case: the content up to
+    /// the trip is coherent, and "length" would make agent clients
+    /// request a continuation of the very loop we just cut.
+    pub(super) content_loop_stop: bool,
     /// Sanitiser state: suppressing content while waiting for a
     /// matching `</parameter>` close after an orphan `<parameter=`.
     pub(super) suppressing_param_leak: bool,
@@ -174,6 +180,7 @@ impl StreamState {
             stop_string_emitted_len: 0,
             refusal_scan_buf: String::new(),
             stop_string_triggered: false,
+            content_loop_stop: false,
             suppressing_param_leak: false,
             suppress_streak_tokens: 0,
             inside_envelope: false,

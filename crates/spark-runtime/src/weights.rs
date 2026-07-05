@@ -191,6 +191,16 @@ impl SafetensorsLoader {
     /// Skips `*.experts.{E}.*` tensors where E is not in local range.
     /// MTP head experts are never skipped (small, fully replicated).
     fn should_skip_tensor(&self, name: &str) -> bool {
+        // Operator-directed skip list: `ATLAS_SKIP_TENSOR_PREFIXES` is a
+        // comma-separated list of tensor-name prefixes to drop at load
+        // (e.g. unused MTP modules / vision tower when memory is tight).
+        // Applies regardless of EP mode.
+        if skip_tensor_prefixes()
+            .iter()
+            .any(|p| name.starts_with(p.as_str()))
+        {
+            return true;
+        }
         if self.ep_world_size <= 1 {
             return false;
         }
@@ -214,6 +224,21 @@ impl SafetensorsLoader {
     }
 }
 
+/// Prefixes from `ATLAS_SKIP_TENSOR_PREFIXES`, parsed once per process.
+fn skip_tensor_prefixes() -> &'static [String] {
+    static PREFIXES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    PREFIXES.get_or_init(|| {
+        std::env::var("ATLAS_SKIP_TENSOR_PREFIXES")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
 /// Parse expert index from tensor name (e.g. "model.layers.3.mlp.experts.42.gate_proj.weight" → 42).
 pub(crate) fn parse_expert_index(name: &str) -> Option<usize> {
     let parts: Vec<&str> = name.split('.').collect();
@@ -223,6 +248,99 @@ pub(crate) fn parse_expert_index(name: &str) -> Option<usize> {
         }
     }
     None
+}
+
+fn is_fused_moe_proj(name: &str) -> bool {
+    const PROJS: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
+    // `weight_scale` = NVFP4 fused group scales; `weight_scale_inv` = FP8
+    // block scales ([E, N/128, K/128] — expert-major, so slicing dim 0 is
+    // correct for it too).
+    const SUFFIXES: [&str; 4] = ["weight", "weight_scale", "weight_scale_inv", "input_scale"];
+    for suffix in SUFFIXES {
+        let Some(rest) = name.strip_suffix(suffix).and_then(|r| r.strip_suffix('.')) else {
+            continue;
+        };
+        for proj in PROJS {
+            if rest
+                .strip_suffix(proj)
+                .is_some_and(|head| head.ends_with(".moe."))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct EpShard {
+    pub ep_rank: usize,
+    pub ep_world_size: usize,
+    pub num_experts: usize,
+}
+
+impl EpShard {
+    pub fn inactive() -> Self {
+        Self {
+            ep_rank: 0,
+            ep_world_size: 1,
+            num_experts: 0,
+        }
+    }
+
+    pub fn from_parts(ep_rank: usize, ep_world_size: usize, num_experts: usize) -> Self {
+        Self {
+            ep_rank,
+            ep_world_size,
+            num_experts,
+        }
+    }
+
+    fn active(self) -> bool {
+        self.ep_world_size > 1 && self.num_experts > 0
+    }
+
+    fn local_range(self) -> (usize, usize) {
+        let per_rank = self.num_experts / self.ep_world_size;
+        let start = self.ep_rank * per_rank;
+        let end = if self.ep_rank + 1 == self.ep_world_size {
+            self.num_experts
+        } else {
+            start + per_rank
+        };
+        (start, end)
+    }
+
+    pub fn fused_slice(
+        self,
+        name: &str,
+        shape: &[usize],
+        full_len: usize,
+    ) -> Option<(usize, usize, Vec<usize>)> {
+        if !self.active() || !is_fused_moe_proj(name) || name.starts_with("mtp.") {
+            return None;
+        }
+        let rows = *shape.first()?;
+        if rows == 0 || !rows.is_multiple_of(self.num_experts) || !full_len.is_multiple_of(rows) {
+            return None;
+        }
+        let (start, end) = self.local_range();
+        let rows_per_expert = rows / self.num_experts;
+        let bytes_per_row = full_len / rows;
+        let local_rows = end.saturating_sub(start) * rows_per_expert;
+        let sub_offset = start * rows_per_expert * bytes_per_row;
+        let sub_len = local_rows * bytes_per_row;
+        let mut local_shape = shape.to_vec();
+        local_shape[0] = local_rows;
+        Some((sub_offset, sub_len, local_shape))
+    }
+
+    pub fn local_bytes(self, name: &str, shape: &[usize], full_len: usize) -> usize {
+        match self.fused_slice(name, shape, full_len) {
+            Some((_, sub_len, _)) => sub_len,
+            None => full_len,
+        }
+    }
 }
 
 mod loader;

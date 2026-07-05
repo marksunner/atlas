@@ -145,7 +145,13 @@ fn has_per_expert_tensors(store: &TensorStore) -> bool {
 - **Per-expert path** (split checkpoint): Loads individual expert tensors,
   compatible with EP filtering. Recommended for production.
 - **Fused path** (HuggingFace original): GPU pointer arithmetic via
-  `slice_fused_experts()`. Single-GPU only, no EP support.
+  `slice_fused_experts()`. The OOM preflight accounts for the local EP
+  shard for any `--ep-size`; use the split checkpoint for production EP
+  deployments when you want per-rank files to show exactly which experts
+  are present.
+
+For launch commands and the required NCCL/RoCE environment, see
+[`docs/DEPLOYMENT.md`](DEPLOYMENT.md#2-multi-rank-ep2--tp2).
 
 ---
 

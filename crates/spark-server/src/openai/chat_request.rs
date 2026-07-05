@@ -398,8 +398,21 @@ impl ChatCompletionRequest {
                 return (budget > 0, Some(budget));
             }
             if let Some(enabled) = kwargs.enable_thinking {
-                let budget = if enabled { DEFAULT_THINKING_BUDGET } else { 0 };
-                return (enabled, Some(budget));
+                // Mirror the legacy `enable_thinking` path (step 5) and the
+                // model default (step 6): when thinking is enabled here
+                // WITHOUT an explicit `thinking_budget`, return `None` for the
+                // budget so `api/chat/thinking.rs` defers to the per-model
+                // `max_thinking_budget` (MODEL.toml) rather than the
+                // conservative DEFAULT_THINKING_BUDGET.
+                //
+                // Issue #193: returning `Some(DEFAULT_THINKING_BUDGET)` here
+                // capped reasoning at 256 tokens, forcing `</think>`
+                // mid-sentence on thinking-tier models (~268 tokens emitted,
+                // then a bare `user:` role-marker leak in `content`). The
+                // equivalent `reasoning_effort`/`enable_thinking` requests
+                // worked precisely because they defer to the model budget.
+                // A disabled value still pins the budget to 0.
+                return (enabled, if enabled { None } else { Some(0) });
             }
         }
 

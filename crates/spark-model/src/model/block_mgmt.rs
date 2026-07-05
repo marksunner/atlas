@@ -179,6 +179,47 @@ pub(crate) fn advance_layer_cursors_after_slide(
     }
 }
 
+/// Sliding-window split pool: grow the per-sequence sliding ring so that
+/// logical block `abs_block_idx` has a live ring slot. The ring holds at
+/// most R = `sliding_ring_blocks` entries; logical block `i` maps to
+/// `sliding_block_table[i % R]`, so once the ring is full every future
+/// logical block is already covered (the ring slot is REUSED, not
+/// re-zeroed — its still-in-window offsets stay live across the wrap;
+/// the per-(slot, offset) overwrite by the KV-write kernel retires old
+/// positions exactly as they leave every sliding layer's window).
+///
+/// No-op when the split pool is off. Never interacts with HSS —
+/// the factory refuses to enable both.
+pub(crate) fn ensure_sliding_ring(
+    seq: &mut SequenceState,
+    abs_block_idx: usize,
+    kv_cache: &mut PagedKvCache,
+    gpu: &dyn GpuBackend,
+    stream: u64,
+) -> Result<()> {
+    let r = kv_cache.sliding_ring_blocks();
+    if r == 0 {
+        return Ok(());
+    }
+    let needed = (abs_block_idx + 1).min(r);
+    while seq.sliding_block_table.len() < needed {
+        let blk = kv_cache.alloc_sliding_block()?;
+        // Zero on FIRST allocation only (stale-KV guard for the fresh
+        // slot); ring wraps must never re-zero.
+        kv_cache.zero_sliding_block(blk, gpu, stream)?;
+        seq.sliding_block_table.push(blk);
+    }
+    Ok(())
+}
+
+/// Free a sequence's sliding ring back to the sliding pool.
+pub(crate) fn free_sliding_ring(seq: &mut SequenceState, kv_cache: &mut PagedKvCache) {
+    for &blk in &seq.sliding_block_table {
+        kv_cache.free_sliding_block(blk);
+    }
+    seq.sliding_block_table.clear();
+}
+
 /// Phase 6.3 — Sliding-window allocation helper (decode path).
 ///
 /// Ensures `seq.physical_block_for(abs_block_idx)` is `Some` after this call
@@ -201,6 +242,8 @@ pub(crate) fn ensure_blocks_through_decode(
     gpu: &dyn GpuBackend,
     stream: u64,
 ) -> Result<()> {
+    // Split pool: keep the sliding ring in lockstep with the full table.
+    ensure_sliding_ring(seq, abs_block_idx, kv_cache, gpu, stream)?;
     let cap = kv_cache.config().cache_blocks_per_seq.map(|c| c as usize);
     // Loop invariant: each iter either slides (frees a block) or grows
     // block_table by one. Terminates when the highest needed logical block
@@ -342,6 +385,8 @@ pub(crate) fn ensure_blocks_through_prefill(
     gpu: &dyn GpuBackend,
     stream: u64,
 ) -> Result<()> {
+    // Split pool: keep the sliding ring in lockstep with the full table.
+    ensure_sliding_ring(seq, abs_block_idx, kv_cache, gpu, stream)?;
     let cap = kv_cache.config().cache_blocks_per_seq.map(|c| c as usize);
     loop {
         let ws = seq.hss_window_start();
@@ -409,6 +454,139 @@ pub(crate) fn extract_layer_refs<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Sliding split pool: ring allocation + mapping semantics ──
+
+    fn split_kv_cache(
+        ring: usize,
+        pool: usize,
+        gpu: &spark_runtime::gpu::mock::MockGpuBackend,
+    ) -> PagedKvCache {
+        use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype};
+        let cfg = KvCacheConfig {
+            block_size: 16,
+            num_kv_heads: 2,
+            head_dim: 64,
+            num_layers: 4,
+            dtype: KvCacheDtype::Bf16,
+            layer_dtypes: vec![],
+            layer_dims: vec![],
+            cache_blocks_per_seq: None,
+            layer_sliding: vec![false, true, true, true],
+            num_sliding_blocks: pool,
+            sliding_ring_blocks: ring,
+        };
+        PagedKvCache::new(cfg, 64, gpu).unwrap()
+    }
+
+    fn empty_seq() -> crate::traits::SequenceState {
+        crate::traits::SequenceState {
+            tokens: Vec::new(),
+            block_table: Vec::new(),
+            seq_len: 0,
+            layer_states: Vec::new(),
+            proposer_state: None,
+            slot_idx: 0,
+            ssm_slot: None,
+            marconi_skip_to: 0,
+            marconi_exact_snap: None,
+            session_hash: 0,
+            chunked_prefill_meta: None,
+            cached_prefix_tokens: 0,
+            kv_valid_tokens: 0,
+            last_decode_ckpt_block: 0,
+            prompt_len: 0,
+            disk_block_ids: Vec::new(),
+            disk_last_offloaded_per_layer: Vec::new(),
+            sliding_block_table: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sliding_ring_grows_to_r_then_wraps_without_allocating() {
+        let gpu = spark_runtime::gpu::mock::MockGpuBackend::new();
+        let mut kv = split_kv_cache(4, 16, &gpu);
+        let mut seq = empty_seq();
+
+        // Logical block 1 → ring holds 2 entries (lazy growth).
+        ensure_sliding_ring(&mut seq, 1, &mut kv, &gpu, 0).unwrap();
+        assert_eq!(seq.sliding_block_table.len(), 2);
+        assert_eq!(kv.num_free_sliding_blocks(), 14);
+
+        // Logical block 100 → ring saturates at R=4 and never grows again.
+        ensure_sliding_ring(&mut seq, 100, &mut kv, &gpu, 0).unwrap();
+        assert_eq!(seq.sliding_block_table.len(), 4);
+        assert_eq!(kv.num_free_sliding_blocks(), 12);
+        ensure_sliding_ring(&mut seq, 10_000, &mut kv, &gpu, 0).unwrap();
+        assert_eq!(seq.sliding_block_table.len(), 4);
+        assert_eq!(kv.num_free_sliding_blocks(), 12);
+
+        // Mapping: logical block i → ring[i % R], stable across wraps.
+        for i in 0..64usize {
+            assert_eq!(
+                seq.sliding_physical_block_for(i, 4),
+                Some(seq.sliding_block_table[i % 4]),
+            );
+        }
+
+        free_sliding_ring(&mut seq, &mut kv);
+        assert_eq!(kv.num_free_sliding_blocks(), 16);
+        assert!(seq.sliding_block_table.is_empty());
+    }
+
+    #[test]
+    fn sliding_ring_noop_when_split_pool_off() {
+        use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype};
+        let cfg = KvCacheConfig {
+            block_size: 16,
+            num_kv_heads: 2,
+            head_dim: 64,
+            num_layers: 4,
+            dtype: KvCacheDtype::Bf16,
+            layer_dtypes: vec![],
+            layer_dims: vec![],
+            cache_blocks_per_seq: None,
+            layer_sliding: Vec::new(),
+            num_sliding_blocks: 0,
+            sliding_ring_blocks: 0,
+        };
+        let gpu = spark_runtime::gpu::mock::MockGpuBackend::new();
+        let mut kv = PagedKvCache::new(cfg, 8, &gpu).unwrap();
+        let mut seq = empty_seq();
+        ensure_sliding_ring(&mut seq, 500, &mut kv, &gpu, 0).unwrap();
+        assert!(seq.sliding_block_table.is_empty());
+        assert_eq!(seq.sliding_physical_block_for(3, 0), None);
+    }
+
+    /// Ring-exactness property (the core correctness argument for
+    /// R = ceil((M_max + window)/bs)): writes for a forward pass of M
+    /// tokens land before its reads, so all positions in
+    /// `(chunk_start − window, chunk_end]` must map to distinct
+    /// (slot, offset) pairs. Two positions share a (slot, offset) iff
+    /// they differ by a multiple of R×bs ≥ M + window > span, so no two
+    /// live positions ever collide.
+    #[test]
+    fn sliding_ring_no_alias_within_live_span() {
+        let bs = 16usize;
+        let window = 512usize;
+        for m_max in [1usize, 16, 100, 2048] {
+            let r = (m_max + window).div_ceil(bs);
+            // Simulate chunked processing at various offsets; check that
+            // within any live span the (ring slot, offset) pairs are unique.
+            for chunk_start in [0usize, 5, 512, 2047, 10_000] {
+                let span_lo = (chunk_start + m_max).saturating_sub(m_max + window - 1);
+                let span_hi = chunk_start + m_max; // exclusive
+                let mut seen = std::collections::HashSet::new();
+                for p in span_lo..span_hi {
+                    let key = ((p / bs) % r, p % bs);
+                    assert!(
+                        seen.insert(key),
+                        "alias at pos {p} (m={m_max} r={r} start={chunk_start})"
+                    );
+                }
+            }
+        }
+    }
 
     // Issue #31 — `check_safe_to_evict` enforces the slide invariant.
 

@@ -98,9 +98,12 @@ fn build_active_seq_from_prefill(
     ssm_ring_capacity: usize,
 ) -> ActiveSeq {
     let temperature = p.temperature;
-    // F4: sticky tool-request flag — grammar attached OR legacy tool path.
-    // Computed before `p.grammar_state` is moved into the struct below.
-    let tool_request = p.grammar_state.is_some() || use_legacy_tool_call;
+    // F4: sticky tool-request flag — grammar attached OR legacy tool path OR
+    // any tools-active turn. Round 14: `p.tools_active` covers the
+    // `disable_tool_grammar=true` + `tool_choice="auto"` case (grammar and
+    // legacy both absent, yet still a tool turn). Computed before
+    // `p.grammar_state` is moved into the struct below.
+    let tool_request = p.grammar_state.is_some() || use_legacy_tool_call || p.tools_active;
     ActiveSeq {
         seq: p.seq,
         session_hash: p.session_hash,
@@ -186,6 +189,7 @@ fn build_active_seq_from_prefill(
         ssm_rollback_ring: SsmDecodeRing::new(ssm_ring_capacity),
         tool_call_end_token,
         grammar_state: p.grammar_state,
+        forced_close_activated: false,
         last_token_time: now,
         request_start: p.request_start,
         decode_start: now,

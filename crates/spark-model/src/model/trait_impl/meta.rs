@@ -191,6 +191,7 @@ impl TransformerModel {
             prompt_len: 0,
             disk_block_ids: Vec::new(),
             disk_last_offloaded_per_layer: vec![0; num_attn_layers],
+            sliding_block_table: Vec::new(),
         })
     }
 

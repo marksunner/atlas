@@ -288,3 +288,27 @@ pub(crate) fn resolve_tokenizer_runtime(
         grammar_engine,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn step3p7_defaults_register_reasoning_and_tool_parsers() {
+        let defaults: toml::Value =
+            toml::from_str(include_str!("../../../tool_defaults.toml")).unwrap();
+
+        assert_eq!(
+            defaults
+                .get("reasoning")
+                .and_then(|t| t.get("step3p7"))
+                .and_then(|v| v.as_str()),
+            Some("qwen")
+        );
+        assert_eq!(
+            defaults
+                .get("model_type")
+                .and_then(|t| t.get("step3p7"))
+                .and_then(|v| v.as_str()),
+            Some("hermes")
+        );
+    }
+}

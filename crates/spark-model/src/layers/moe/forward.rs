@@ -244,6 +244,8 @@ impl MoeLayer {
                     stream,
                 )
             })?;
+            self.clamp_routed_gate_up(ctx.gpu, expert_gate_out, expert_up_out, top_k * inter, stream)?;
+            self.clamp_shared_gate_up(ctx.gpu, shared_gate_scratch, shared_up_scratch, inter, stream)?;
             prof!("exp_silu_down_bf16", {
                 ops::moe_expert_silu_down_shared_bf16(
                     ctx.gpu,
@@ -292,6 +294,9 @@ impl MoeLayer {
                     stream,
                 )
             })?;
+
+            self.clamp_routed_gate_up(ctx.gpu, expert_gate_out, expert_up_out, top_k * inter, stream)?;
+            self.clamp_shared_gate_up(ctx.gpu, shared_gate_scratch, shared_up_scratch, inter, stream)?;
 
             // FP8 path: fused silu+down
             prof!("exp_silu_down_fp8", {
@@ -400,6 +405,11 @@ impl MoeLayer {
                     .collect();
                 tracing::info!("  MoE shared_up_scratch[0..8]: {:?}", su_vals);
             }
+
+            // Step 3.7 swiglu_limits: clamp gate/up outputs in place before
+            // the fused silu+down (no-op on layers without limits).
+            self.clamp_routed_gate_up(ctx.gpu, expert_gate_out, expert_up_out, top_k * inter, stream)?;
+            self.clamp_shared_gate_up(ctx.gpu, shared_gate_scratch, shared_up_scratch, inter, stream)?;
 
             // NVFP4 path: fused routed+shared silu+down
             prof!("exp_silu_down", {

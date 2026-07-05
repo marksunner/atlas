@@ -17,6 +17,9 @@ fn test_config() -> KvCacheConfig {
         layer_dtypes: vec![],
         layer_dims: vec![],
         cache_blocks_per_seq: None,
+        layer_sliding: Vec::new(),
+        num_sliding_blocks: 0,
+        sliding_ring_blocks: 0,
     }
 }
 
@@ -317,6 +320,9 @@ fn test_mixed_dtype_pool_allocation() {
         layer_dtypes,
         layer_dims: vec![],
         cache_blocks_per_seq: None,
+        layer_sliding: Vec::new(),
+        num_sliding_blocks: 0,
+        sliding_ring_blocks: 0,
     };
     let cache = PagedKvCache::new(cfg, 4, &gpu).unwrap();
 
@@ -343,6 +349,9 @@ fn sliding_window_recycles_blocks() {
     // Tiny pool: 2 sequences × 4 blocks/seq = 8 total physical blocks.
     let cfg = KvCacheConfig {
         cache_blocks_per_seq: Some(4),
+        layer_sliding: Vec::new(),
+        num_sliding_blocks: 0,
+        sliding_ring_blocks: 0,
         ..test_config()
     };
     let mut cache = PagedKvCache::new(cfg, 8, &gpu).unwrap();
@@ -412,4 +421,129 @@ fn alloc_after_free_round_trip_returns_same_block_lifo() {
     assert_eq!(cache.num_free_blocks(), 0);
     cache.free_block(b3);
     cache.free_block(recycled);
+}
+
+// ── Sliding-window split pool (Step 3.7 / Gemma-4 hybrid attention) ──
+
+/// 12-layer config: layers 0-2 full attention, 3-11 sliding. Ring of 4
+/// blocks per sequence, sliding pool of 9 blocks (2 seqs × 4 + 1 dummy).
+fn split_config() -> KvCacheConfig {
+    KvCacheConfig {
+        dtype: KvCacheDtype::Bf16,
+        layer_sliding: (0..12).map(|i| i >= 3).collect(),
+        num_sliding_blocks: 9,
+        sliding_ring_blocks: 4,
+        ..test_config()
+    }
+}
+
+#[test]
+fn test_split_pool_activation_gating() {
+    // All three fields must be set for the split pool to engage.
+    let cfg = test_config();
+    assert!(!cfg.split_sliding_active());
+    let cfg = KvCacheConfig {
+        num_sliding_blocks: 8,
+        sliding_ring_blocks: 4,
+        ..test_config()
+    };
+    assert!(
+        !cfg.split_sliding_active(),
+        "no sliding layers marked → off"
+    );
+    let cfg = split_config();
+    assert!(cfg.split_sliding_active());
+    assert!(!cfg.is_sliding_layer(0));
+    assert!(cfg.is_sliding_layer(3));
+    assert!(cfg.is_sliding_layer(11));
+    assert!(!cfg.is_sliding_layer(12), "out of range → false");
+}
+
+#[test]
+fn test_split_pool_byte_accounting() {
+    let cfg = split_config();
+    // BF16: 16 tok × 2 heads × 256 dim × 2 B = 16384 per side, ×2 (K+V).
+    let per_layer_kv = 32768usize;
+    assert_eq!(cfg.block_bytes_kv_full_layers(), 3 * per_layer_kv);
+    assert_eq!(cfg.sliding_pool_bytes(), 9 * 9 * per_layer_kv);
+    // Non-split config: full-layer sum covers ALL layers.
+    let uniform = KvCacheConfig {
+        dtype: KvCacheDtype::Bf16,
+        ..test_config()
+    };
+    assert_eq!(uniform.block_bytes_kv_full_layers(), 12 * per_layer_kv);
+}
+
+#[test]
+fn test_split_pool_compute_num_blocks_reserves_sliding() {
+    let cfg = split_config();
+    let per_layer_kv = 32768usize;
+    let sliding_cost = cfg.sliding_pool_bytes();
+    // Budget for the sliding pool + exactly 10 full blocks.
+    let budget = sliding_cost + 10 * 3 * per_layer_kv;
+    let n = PagedKvCache::compute_num_blocks(&cfg, budget).unwrap();
+    assert_eq!(n, 10);
+    // A budget smaller than the fixed sliding cost is a hard error.
+    assert!(PagedKvCache::compute_num_blocks(&cfg, sliding_cost - 1).is_err());
+    // Non-split path unchanged: budget / all-layer block cost.
+    let uniform = KvCacheConfig {
+        dtype: KvCacheDtype::Bf16,
+        ..test_config()
+    };
+    let n = PagedKvCache::compute_num_blocks(&uniform, 12 * per_layer_kv * 7).unwrap();
+    assert_eq!(n, 7);
+}
+
+#[test]
+fn test_split_pool_alloc_free_independent_id_spaces() {
+    let gpu = MockGpuBackend::new();
+    let mut cache = PagedKvCache::new(split_config(), 10, &gpu).unwrap();
+    assert_eq!(cache.num_free_blocks(), 10);
+    assert_eq!(cache.num_free_sliding_blocks(), 9);
+
+    // Full-pool alloc does not consume sliding blocks and vice versa.
+    let f0 = cache.alloc_block().unwrap();
+    let s0 = cache.alloc_sliding_block().unwrap();
+    assert_eq!(cache.num_free_blocks(), 9);
+    assert_eq!(cache.num_free_sliding_blocks(), 8);
+    assert!((s0 as usize) < 9, "sliding IDs live in the sliding ID space");
+
+    // Exhaust the sliding pool: 8 more allocs succeed, the 10th fails.
+    for _ in 0..8 {
+        cache.alloc_sliding_block().unwrap();
+    }
+    assert!(cache.alloc_sliding_block().is_err());
+
+    cache.free_sliding_block(s0);
+    assert_eq!(cache.num_free_sliding_blocks(), 1);
+    assert_eq!(cache.alloc_sliding_block().unwrap(), s0);
+    cache.free_block(f0);
+}
+
+#[test]
+fn test_split_pool_zero_block_skips_sliding_layers() {
+    // zero_block on a full-pool ID beyond the sliding pool size must not
+    // touch sliding layers (their pools are only num_sliding_blocks long).
+    // MockGpuBackend memsets host-shadow memory, so an OOB write would
+    // panic/corrupt; surviving the call with a large block idx proves the
+    // sliding layers were skipped.
+    let gpu = MockGpuBackend::new();
+    let cache = PagedKvCache::new(split_config(), 32, &gpu).unwrap();
+    cache.zero_block(31, &gpu, 0).unwrap();
+    cache.zero_sliding_block(8, &gpu, 0).unwrap();
+}
+
+#[test]
+fn test_no_split_models_unchanged() {
+    // Contract item 5: models without sliding window see identical pool
+    // shape and alloc behavior.
+    let gpu = MockGpuBackend::new();
+    let mut cache = PagedKvCache::new(test_config(), 10, &gpu).unwrap();
+    assert_eq!(cache.num_free_sliding_blocks(), 0);
+    assert_eq!(cache.sliding_ring_blocks(), 0);
+    assert!(cache.alloc_sliding_block().is_err());
+    // zero_block covers ALL layers when the split pool is off (legacy).
+    cache.zero_block(9, &gpu, 0).unwrap();
+    let b = cache.alloc_block().unwrap();
+    cache.free_block(b);
 }

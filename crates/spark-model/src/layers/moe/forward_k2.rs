@@ -133,6 +133,8 @@ impl MoeLayer {
                 top_k,
                 stream,
             )?;
+            self.clamp_routed_gate_up(ctx.gpu, expert_gate_out, expert_up_out, 2 * top_k * inter, stream)?;
+            self.clamp_shared_gate_up(ctx.gpu, shared_gate_scratch, shared_up_scratch, 2 * inter, stream)?;
             ops::moe_expert_silu_down_shared_fp8_batch2(
                 ctx.gpu,
                 self.moe_expert_silu_down_shared_fp8_batch2,
@@ -213,6 +215,8 @@ impl MoeLayer {
                 top_k,
                 stream,
             )?;
+            self.clamp_routed_gate_up(ctx.gpu, expert_gate_out, expert_up_out, 2 * top_k * inter, stream)?;
+            self.clamp_shared_gate_up(ctx.gpu, shared_gate_scratch, shared_up_scratch, 2 * inter, stream)?;
             ops::moe_expert_silu_down_shared_batch2_t(
                 ctx.gpu,
                 self.moe_expert_silu_down_shared_batch2_t_k,
@@ -262,6 +266,8 @@ impl MoeLayer {
                 batch2_block,
                 stream,
             )?;
+            self.clamp_routed_gate_up(ctx.gpu, expert_gate_out, expert_up_out, 2 * top_k * inter, stream)?;
+            self.clamp_shared_gate_up(ctx.gpu, shared_gate_scratch, shared_up_scratch, 2 * inter, stream)?;
             ops::moe_expert_silu_down_shared_batch2(
                 ctx.gpu,
                 self.moe_expert_silu_down_shared_batch2,

@@ -189,6 +189,15 @@ impl MoeLayer {
         // 6. Activation+mul for routed experts + grouped down GEMM (K64 pipelined).
         let expert_down_out = ctx.buffers.expert_down_out();
         if max_m_tiles > 0 {
+            // Step 3.7 swiglu_limits: clamp routed gate/up before activation
+            // (no-op on layers without limits).
+            self.clamp_routed_gate_up(
+                ctx.gpu,
+                expert_gate_out,
+                expert_up_out,
+                total_expanded * inter,
+                stream,
+            )?;
             ops::silu_mul(
                 ctx.gpu,
                 self.moe_act_mul,

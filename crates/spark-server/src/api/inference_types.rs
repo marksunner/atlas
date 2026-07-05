@@ -105,6 +105,15 @@ pub enum InferenceRequest {
         repetition_detection: Option<RepetitionDetectionParams>,
         /// Whether a tool call is required (tool_choice="required").
         require_tool_call: bool,
+        /// Whether this turn has tools available at all (any `tool_choice`,
+        /// including `"auto"`). Distinct from `require_tool_call` (which is
+        /// only `"required"`) and from `grammar_spec.is_some()` (which is
+        /// `None` when `[behavior].disable_tool_grammar=true`). This is the
+        /// only signal that survives to prefill telling us "this is a tool
+        /// turn" for the grammar-disabled/`auto` case — used to set the
+        /// sticky `tool_request` flag so tool-scoped logit processors and
+        /// the inter-tool prose watchdog activate.
+        tools_active: bool,
         /// Suppress `<tool_call>` token when tool call loop detected (≥3 identical).
         suppress_tool_call: bool,
         /// F60 (2026-04-27): disable MTP speculative decoding for this
@@ -178,6 +187,11 @@ pub enum InferenceRequest {
         repetition_detection: Option<RepetitionDetectionParams>,
         /// Whether a tool call is required (tool_choice="required").
         require_tool_call: bool,
+        /// Whether this turn has tools available at all (any `tool_choice`,
+        /// including `"auto"`). See the `Blocking` variant for the full
+        /// rationale — the sticky `tool_request` signal for the
+        /// grammar-disabled/`auto` case.
+        tools_active: bool,
         /// Suppress `<tool_call>` token when tool call loop detected (≥3 identical).
         suppress_tool_call: bool,
         /// F60 (2026-04-27): disable MTP speculative decoding for this

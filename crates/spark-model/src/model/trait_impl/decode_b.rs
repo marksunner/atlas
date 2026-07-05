@@ -326,6 +326,67 @@ impl TransformerModel {
             )?;
         }
 
+        // Sliding split pool: mirror upload_meta (chunk 0, host-built
+        // slots) / upload_paged (chunk 1+, delta table + fill_slots) for
+        // the mixed-forward prefill lane. The decode lanes above staged
+        // their own twin via upload_batch_metadata_at (distinct regions).
+        let ring_len = self.sliding_ring_len();
+        let mut prefill_sliding_bt = DevicePtr::NULL;
+        if ring_len > 0 {
+            if needs_paged {
+                let current_blocks = prefill_seq.block_table.len();
+                let meta_ref = prefill_seq.chunked_prefill_meta.as_ref().unwrap();
+                let sliding_upload_start = meta_ref.uploaded_sliding_blocks;
+                prefill_sliding_bt = meta_ref.sliding_block_table;
+                if sliding_upload_start < current_blocks {
+                    let entries: Vec<i32> = (sliding_upload_start..current_blocks)
+                        .map(|i| {
+                            prefill_seq
+                                .sliding_physical_block_for(i, ring_len)
+                                .unwrap_or(self.dummy_sliding_block)
+                                as i32
+                        })
+                        .collect();
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(entries.as_ptr() as *const u8, entries.len() * 4)
+                    };
+                    self.gpu.copy_h2d_async(
+                        bytes,
+                        prefill_sliding_bt
+                            .offset(sliding_upload_start * std::mem::size_of::<u32>()),
+                        stream,
+                    )?;
+                    prefill_seq
+                        .chunked_prefill_meta
+                        .as_mut()
+                        .unwrap()
+                        .uploaded_sliding_blocks = current_blocks;
+                }
+                ops::fill_slots_from_block_table(
+                    self.gpu.as_ref(),
+                    self.fill_slots_kernel,
+                    self.sliding_prefill_slots_base(),
+                    prefill_sliding_bt,
+                    proc_start as u32,
+                    proc_count as u32,
+                    bs as u32,
+                    stream,
+                )?;
+            } else {
+                let sliding_slots: Vec<i64> = (proc_start..proc_start + proc_count)
+                    .map(|i| self.sliding_slot_for(prefill_seq, i, bs, ring_len))
+                    .collect();
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        sliding_slots.as_ptr() as *const u8,
+                        sliding_slots.len() * 8,
+                    )
+                };
+                self.gpu
+                    .copy_h2d_async(bytes, self.sliding_prefill_slots_base(), stream)?;
+            }
+        }
+
         // Force H2D metadata copies to complete before layer forward.
         self.gpu.synchronize(stream)?;
 
@@ -345,6 +406,12 @@ impl TransformerModel {
             block_table: prefill_bt_dev,
             max_blocks_per_seq: prefill_seq.block_table.len() as u32,
             num_seqs: 1,
+            sliding_slot: if ring_len > 0 {
+                self.sliding_prefill_slots_base()
+            } else {
+                DevicePtr(0)
+            },
+            sliding_block_table: prefill_sliding_bt,
         };
 
         // ── 5. Build decode layer states ──

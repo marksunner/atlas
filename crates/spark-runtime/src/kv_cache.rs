@@ -207,9 +207,59 @@ pub struct KvCacheConfig {
     /// admission control. The `try_evict_oldest_for_seq` helper below is
     /// only valid when this is `Some`.
     pub cache_blocks_per_seq: Option<u32>,
+    /// Sliding-window split-pool: `layer_sliding[i]` marks attention layer
+    /// `i` as a sliding-window layer whose pool is allocated with
+    /// `num_sliding_blocks` blocks (its own block-ID space) instead of the
+    /// full `num_blocks`. Empty = feature off (all layers share one ID
+    /// space, backward compatible).
+    pub layer_sliding: Vec<bool>,
+    /// Total blocks in each sliding layer's pool. 0 = split-pool off.
+    pub num_sliding_blocks: usize,
+    /// Per-sequence sliding ring length R (blocks). A sequence's logical
+    /// block `i` maps to `sliding_block_table[i % R]`, so the ring must
+    /// cover the largest span of positions that can be simultaneously
+    /// live: `R × block_size ≥ max_tokens_per_forward + sliding_window`
+    /// (writes for a chunk land before its paged-attention reads, so the
+    /// chunk plus the trailing window must never alias in the ring).
+    pub sliding_ring_blocks: usize,
 }
 
 impl KvCacheConfig {
+    /// True when the sliding-window split pool is engaged: sliding layers
+    /// have their own (smaller) block-ID space and per-sequence ring
+    /// tables. All three fields must be consistent — the factory sets
+    /// them together.
+    pub fn split_sliding_active(&self) -> bool {
+        self.num_sliding_blocks > 0
+            && self.sliding_ring_blocks > 0
+            && self.layer_sliding.iter().any(|s| *s)
+    }
+
+    /// Whether attention layer `i` uses the sliding split pool.
+    pub fn is_sliding_layer(&self, layer_idx: usize) -> bool {
+        self.split_sliding_active() && self.layer_sliding.get(layer_idx).copied().unwrap_or(false)
+    }
+
+    /// Sum of K+V block bytes across FULL-attention layers only (one block
+    /// slot). Under the split pool this is the per-block cost that scales
+    /// with sequence length; sliding layers are excluded because their
+    /// pools are fixed-size.
+    pub fn block_bytes_kv_full_layers(&self) -> usize {
+        (0..self.num_layers)
+            .filter(|&i| !self.is_sliding_layer(i))
+            .map(|i| self.k_block_bytes_for_layer(i) + self.v_block_bytes_for_layer(i))
+            .sum()
+    }
+
+    /// Total bytes of all sliding layers' pools (fixed cost, paid once).
+    pub fn sliding_pool_bytes(&self) -> usize {
+        let per_block: usize = (0..self.num_layers)
+            .filter(|&i| self.is_sliding_layer(i))
+            .map(|i| self.k_block_bytes_for_layer(i) + self.v_block_bytes_for_layer(i))
+            .sum();
+        self.num_sliding_blocks * per_block
+    }
+
     /// Resolve the effective dtype for a given attention layer index.
     pub fn dtype_for_layer(&self, layer_idx: usize) -> KvCacheDtype {
         if layer_idx < self.layer_dtypes.len() {
@@ -436,6 +486,11 @@ pub struct PagedKvCache {
     /// Per-block reference count. Enables shared blocks (prefix caching).
     /// Default: 1 on alloc, freed when decremented to 0.
     block_ref_counts: Vec<u32>,
+    /// Sliding split pool free list (block IDs in the SLIDING ID space,
+    /// valid only for layers where `config.is_sliding_layer(i)`). Empty
+    /// vec when the split pool is off. Ring blocks are per-sequence
+    /// private (never shared), so no ref counting is needed.
+    free_sliding_blocks: Vec<u32>,
     config: KvCacheConfig,
 }
 

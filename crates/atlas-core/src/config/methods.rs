@@ -33,18 +33,31 @@ impl ModelConfig {
         }
     }
 
-    /// Number of full attention layers.
+    /// Number of attention layers (full + sliding) that need KV cache.
     pub fn num_attention_layers(&self) -> usize {
         if !self.layer_types.is_empty() {
             self.layer_types
                 .iter()
-                .filter(|t| **t == LayerType::FullAttention)
+                .filter(|t| matches!(t, LayerType::FullAttention | LayerType::SlidingAttention))
                 .count()
         } else {
             self.num_hidden_layers
                 .checked_div(self.full_attention_interval)
                 .unwrap_or(self.num_hidden_layers)
         }
+    }
+
+    /// Per-ATTENTION-layer sliding flags in attention-layer order (the KV
+    /// cache's layer indexing: index k = k-th layer whose type is Full- or
+    /// SlidingAttention). Empty when `layer_types` is empty — the
+    /// sliding-window split KV pool must NOT be enabled from loader-side
+    /// fallback patterns, only from an explicit per-layer config.
+    pub fn attention_layer_sliding_flags(&self) -> Vec<bool> {
+        self.layer_types
+            .iter()
+            .filter(|t| matches!(t, LayerType::FullAttention | LayerType::SlidingAttention))
+            .map(|t| matches!(t, LayerType::SlidingAttention))
+            .collect()
     }
 
     /// Number of SSM (linear attention) layers.

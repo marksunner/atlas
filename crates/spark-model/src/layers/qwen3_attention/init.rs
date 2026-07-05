@@ -109,6 +109,7 @@ impl Qwen3AttentionLayer {
             sliding_window: None,
             rope_theta_override: None,
             rotary_dim_override: None,
+            rope_inv_freq_table: spark_runtime::gpu::DevicePtr::NULL,
             rope_proportional: false,
             attn_scale_override: None,
             k_eq_v: false,

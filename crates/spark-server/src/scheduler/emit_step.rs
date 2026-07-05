@@ -168,15 +168,23 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         a.grammar_state = None;
     }
 
-    // Accumulate logprobs data for blocking responses.
-    if let Some(lp) = logprobs {
-        a.logprobs_data.push(lp);
-    }
-
-    a.output_tokens.push(tok);
-
-    // Thinking tokens are "free" (don't decrement remaining).
-    // Detect </think> transition. Track thinking token count for budget enforcement.
+    // Thinking / content bookkeeping — run FIRST, BEFORE the EOS decision, to
+    // mirror `decode_logits_step::process_decode_logits` (#100 v3 Finding 2).
+    //
+    // The non-MTP path advances its thinking-token counter (or runs
+    // `handle_content_token`: `consume_generation_budget`, content-loop / prose
+    // watchdogs) in its per-token step, AHEAD of its EOS gate — so a SUPPRESSED
+    // EOS there still advances `thinking_tokens`, the thinking budget, the
+    // content watchdogs, and the generation budget before being discarded. v2
+    // ran this block AFTER the push and returned early on a suppressed EOS,
+    // freezing all of that state on the MTP/verify path (the v2 evaluator's
+    // parity finding). Running it first restores exact parity: every token —
+    // normal, stopping EOS, or suppressed EOS — advances the same state as
+    // non-MTP. Like non-MTP this runs PRE-push (`output_tokens` does not yet
+    // contain `tok`), so the loop detectors see the identical slice.
+    //
+    // Detect the `</think>` transition. Thinking tokens are "free" (don't
+    // decrement remaining) and are stripped from the API output.
     if a.inside_thinking {
         if a.think_end_token == Some(tok) {
             a.inside_thinking = false;
@@ -286,6 +294,11 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
                 CONTENT_LOOP_PERIOD_MIN,
                 CONTENT_LOOP_PERIOD_MAX,
             );
+            // Push an EOS so finish_sequence reports "stop", not "length" —
+            // see decode_logits_content.rs content-loop fallback for rationale.
+            if let Some(&eos) = a.eos_tokens.first() {
+                a.output_tokens.push(eos);
+            }
             a.finished = true;
         }
 
@@ -326,7 +339,14 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         }
     }
 
-    // EOS handling: grammar-based, legacy, or min_tokens suppression.
+    // EOS handling — mirror `decode_logits_step::process_decode_logits` EXACTLY
+    // so the MTP/verify path and the non-MTP decode path share one stop policy
+    // (#100 Finding 1). Decided AFTER the thinking/content bookkeeping above (so
+    // a suppressed EOS advances the same counters/budget/watchdogs as non-MTP —
+    // #100 v3 Finding 2) but BEFORE `output_tokens.push(tok)` below, so a
+    // SUPPRESSED EOS is never counted in `output_tokens` — identical to the
+    // non-MTP empty suppressed branch, which discards without pushing.
+    //
     // Fix A (2026-06-05, kill-switch): in tool_choice="auto" the grammar's
     // is_terminated() never becomes true after a tool call, so EOS is suppressed
     // forever — trapping the model into a hallucinated-transcript runaway. When
@@ -344,17 +364,55 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         && !eos_escape;
     let legacy_suppresses_eos = a.require_tool_call;
     let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
-    let suppress_eos = grammar_suppresses_eos || legacy_suppresses_eos || min_tokens_suppresses;
+    // #100 Finding 1: thinking / post-think EOS suppression — MISSING on this
+    // path pre-fix, so an `<|im_end|>` sampled inside `<think>` (spurious) or in
+    // the first few post-`</think>` content tokens could prematurely end the
+    // turn. Only `</think>` (think_end_token) ends the thinking phase. Kept
+    // byte-for-byte in lockstep with `decode_logits_step.rs`. NB: the bookkeeping
+    // above already ran, so if `tok` was `</think>` we are now `!inside_thinking`
+    // with `think_ended`, exactly as non-MTP computes these at the same point.
+    let thinking_suppresses_eos = a.inside_thinking;
+    // Keep in lockstep with decode_logits_step's POST_THINK_MIN_CONTENT.
+    const POST_THINK_MIN_CONTENT: u32 = 16;
+    let post_think_content_tokens =
+        (a.output_tokens.len() as u32).saturating_sub(a.thinking_tokens);
+    let post_think_suppresses_eos =
+        a.think_ended && post_think_content_tokens < POST_THINK_MIN_CONTENT;
+    let suppress_eos = grammar_suppresses_eos
+        || legacy_suppresses_eos
+        || min_tokens_suppresses
+        || thinking_suppresses_eos
+        || post_think_suppresses_eos;
 
-    if a.eos_tokens.contains(&tok) && !suppress_eos {
-        a.finished = true;
-        return;
+    match retain_token_after_eos_decision(
+        tok,
+        logprobs,
+        &a.eos_tokens,
+        suppress_eos,
+        &mut a.output_tokens,
+        &mut a.logprobs_data,
+    ) {
+        EmitRetention::StoppingEos => {
+            // Stopping EOS: count it (correct token count + finish_reason="stop") but
+            // do NOT stream it (OpenAI spec: returned text must exclude the stop
+            // sequence). Bookkeeping already ran above — matching the non-MTP path,
+            // which runs `handle_content_token` before its `is_eos_stop` push.
+            a.finished = true;
+            return;
+        }
+        EmitRetention::SuppressedEos => {
+            // EOS suppressed (grammar mid tool-call, unmet min_tokens, legacy
+            // require_tool_call, inside `<think>`, or the post-think content floor).
+            // Discard it: do NOT push to `output_tokens` (#100 Finding 2) and do NOT
+            // stream it — the model keeps generating. The thinking/content counters,
+            // budget, and watchdogs were ALREADY advanced by the bookkeeping above,
+            // so this is byte-for-byte the non-MTP suppressed branch: bookkeeping
+            // ran, token discarded, no finish.
+            return;
+        }
+        EmitRetention::Retained => {}
     }
-    if a.eos_tokens.contains(&tok) && suppress_eos {
-        // EOS suppressed: grammar not terminated, legacy tool call not yet seen,
-        // or min_tokens not reached. Don't stop — let the model continue generating.
-        return;
-    }
+
     // OPENCODE FIX: see process_decode_logits — same gate. Suppress streaming
     // of spontaneous-thinking content so it doesn't pollute opencode's history.
     let suppress_stream = a.inside_thinking && !a.enable_thinking;
@@ -536,13 +594,98 @@ fn advance_envelope_streak(inside_parameter_body: bool, streak: u32) -> (u32, bo
     }
 }
 
+/// Pure decision core (#100): does sampling `tok` end the sequence *now*?
+///
+/// A token stops generation iff it is one of the sequence's EOS / stop-token
+/// ids (`eos_tokens`) AND EOS is not currently suppressed. Each decode path
+/// composes its own `suppress_eos` (grammar mid tool-call, unmet `min_tokens`
+/// floor, legacy `require_tool_call`, thinking / post-think gates); this core
+/// is the single "should we stop?" decision both paths share:
+///   * non-MTP decode — `decode_logits_step::process_decode_logits`
+///   * MTP / speculative verify — `emit_token`, invoked per accepted draft by
+///     `verify_dflash_step` / `verify_k4_step` / `verify_k2_step`, each of
+///     which returns the moment `a.finished` flips. So an EOS anywhere inside a
+///     speculated run flips `finished` here, the verify loop breaks, and every
+///     later draft in that run is dropped — the "verify path catches EOS in
+///     speculated tokens" guarantee.
+///
+/// Model-agnostic: `eos_tokens` is whatever the tokenizer/config declared plus
+/// the force-added ChatML `<|im_end|>` (see `tokenizer_runtime.rs`), never a
+/// hardcoded per-model id. Pure over slices/scalars so it is unit-tested
+/// directly, mirroring `advance_envelope_streak` (an `ActiveSeq` fixture needs
+/// a GPU-backed `SequenceState` and is deliberately never built in unit tests).
+pub(crate) fn is_eos_stop(tok: u32, eos_tokens: &[u32], suppress_eos: bool) -> bool {
+    eos_tokens.contains(&tok) && !suppress_eos
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmitRetention {
+    Retained,
+    StoppingEos,
+    SuppressedEos,
+}
+
+pub(crate) fn retain_token_after_eos_decision(
+    tok: u32,
+    logprobs: Option<crate::api::TokenLogprobs>,
+    eos_tokens: &[u32],
+    suppress_eos: bool,
+    output_tokens: &mut Vec<u32>,
+    logprobs_data: &mut Vec<crate::api::TokenLogprobs>,
+) -> EmitRetention {
+    if is_eos_stop(tok, eos_tokens, suppress_eos) {
+        output_tokens.push(tok);
+        if let Some(lp) = logprobs {
+            logprobs_data.push(lp);
+        }
+        return EmitRetention::StoppingEos;
+    }
+
+    if eos_tokens.contains(&tok) && suppress_eos {
+        return EmitRetention::SuppressedEos;
+    }
+
+    output_tokens.push(tok);
+    if let Some(lp) = logprobs {
+        logprobs_data.push(lp);
+    }
+    EmitRetention::Retained
+}
+
 pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
     if a.inside_thinking {
         return;
     }
     if a.tool_call_start_token == Some(tok) {
-        a.inside_tool_body = true;
-        a.tool_body_streak_tokens = 0;
+        // STEP37-QUALITY Round 16: a `<tool_call>` opener that arrives while
+        // we are ALREADY inside a tool body (no intervening `</tool_call>`) is
+        // always malformed — a second call never validly nests inside the
+        // first, and single-call-per-response means `</tool_call>` would have
+        // stopped generation. Hermes-format tool loops re-emit the opener
+        // (`<tool_call>\nweb_search>` ×hundreds) every ~4 tokens; the old
+        // unconditional `= 0` reset pinned the streak at zero forever, so the
+        // `MAX_TOOL_BODY_TOKENS` envelope guard never tripped and the runaway
+        // ran to the tool `max_tokens` cap (~8192 tok ≈ 270s of garbage). Count
+        // the malformed reopen as envelope junk instead of resetting, so the
+        // guard bounds the opener loop. The special-token id only appears when
+        // the model deliberately emits it (arbitrary parameter-value text
+        // tokenizes to byte-BPE, not this single id), so counting it is safe
+        // even mid-`<parameter=…>` value.
+        if a.inside_tool_body {
+            a.tool_body_streak_tokens = a.tool_body_streak_tokens.saturating_add(1);
+            if a.tool_body_streak_tokens > MAX_TOOL_BODY_TOKENS {
+                tracing::warn!(
+                    streak = a.tool_body_streak_tokens,
+                    "Repeated <tool_call> opener with no </tool_call> for \
+                     {MAX_TOOL_BODY_TOKENS}+ tokens; ending response (opener loop \
+                     — would otherwise burn to the tool max_tokens cap)."
+                );
+                a.finished = true;
+            }
+        } else {
+            a.inside_tool_body = true;
+            a.tool_body_streak_tokens = 0;
+        }
         return;
     }
     if a.tool_call_end_token == Some(tok) {
@@ -707,5 +850,203 @@ mod cc6_envelope_streak_tests {
         let (s, exceeded) = advance_envelope_streak(false, u32::MAX);
         assert_eq!(s, u32::MAX);
         assert!(exceeded);
+    }
+}
+
+#[cfg(test)]
+mod eos_stop_tests {
+    //! Issue #100: the shared EOS-stop decision (`is_eos_stop`) governs when a
+    //! sampled/speculated token ends the sequence, for BOTH the non-MTP decode
+    //! path and the MTP speculative-verify path. Tested on the pure core (no
+    //! `ActiveSeq` fixture — it needs a GPU `SequenceState`; see
+    //! `cc6_envelope_streak_tests` / `rollback_tests.rs` for the same pattern).
+    use super::{EmitRetention, is_eos_stop, retain_token_after_eos_decision};
+
+    // ── basic EOS ───────────────────────────────────────────────────────
+    #[test]
+    fn basic_eos_token_stops() {
+        // 151645 = Qwen ChatML <|im_end|>; 151643 = <|endoftext|>. Referenced
+        // by id only — no hardcoded per-model literal in production.
+        let eos = [151645u32, 151643];
+        assert!(is_eos_stop(151645, &eos, false), "<|im_end|> must stop");
+        assert!(is_eos_stop(151643, &eos, false), "<|endoftext|> must stop");
+    }
+
+    #[test]
+    fn non_eos_token_does_not_stop() {
+        let eos = [151645u32];
+        assert!(
+            !is_eos_stop(42, &eos, false),
+            "a content token must not stop"
+        );
+    }
+
+    // ── multiple stop tokens in the set ─────────────────────────────────
+    #[test]
+    fn any_of_multiple_eos_ids_stops() {
+        // A model / request can declare several stop-token ids; matching ANY
+        // one ends the turn.
+        let eos = [2u32, 7, 151645];
+        for &t in &eos {
+            assert!(is_eos_stop(t, &eos, false), "id {t} in the set must stop");
+        }
+        assert!(!is_eos_stop(3, &eos, false));
+    }
+
+    // ── suppression (thinking / grammar / min_tokens / require_tool_call) ─
+    #[test]
+    fn suppressed_eos_does_not_stop() {
+        // When EOS is suppressed (grammar mid tool-call, unmet min_tokens,
+        // legacy require_tool_call, inside <think>), the very same EOS id must
+        // NOT terminate — the model keeps generating. This is what lets a
+        // spurious <|im_end|> inside <think> flow through unchanged.
+        let eos = [151645u32];
+        assert!(
+            !is_eos_stop(151645, &eos, true),
+            "suppressed EOS must not stop"
+        );
+    }
+
+    // ── MTP / speculative decode: verify path catches EOS ───────────────
+    #[test]
+    fn mtp_speculated_run_stops_at_first_eos_and_drops_tail() {
+        // Models the real verify loop (`verify_dflash_step` / `verify_k4_step`):
+        //   for d in drafts { emit_token(d); if a.finished { return } }
+        // `emit_token` pushes the token to output_tokens (so the EOS is counted
+        // and finish_reason="stop") then finishes exactly when `is_eos_stop` is
+        // true. Every draft AFTER the EOS must be dropped.
+        let eos = [151645u32];
+        let drafts = [10u32, 11, 151645, 12, 13]; // EOS speculated at index 2
+        let mut emitted = Vec::new();
+        let mut logprobs = Vec::new();
+        let mut finished = false;
+        for &d in &drafts {
+            let retained =
+                retain_token_after_eos_decision(d, None, &eos, false, &mut emitted, &mut logprobs);
+            if retained == EmitRetention::StoppingEos {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished, "EOS in a speculated run must finish the sequence");
+        assert_eq!(
+            emitted,
+            vec![10, 11, 151645],
+            "accepted run includes the EOS; later drafts are dropped"
+        );
+        assert_eq!(drafts.len() - emitted.len(), 2, "2 trailing drafts dropped");
+    }
+
+    #[test]
+    fn mtp_suppressed_eos_in_run_does_not_break() {
+        // If EOS is suppressed (e.g. speculated <|im_end|> while a tool-call
+        // grammar is still open), the speculated run must NOT terminate on it.
+        let eos = [151645u32];
+        let drafts = [10u32, 151645, 11];
+        let mut emitted = Vec::new();
+        let mut logprobs = Vec::new();
+        let mut finished = false;
+        for &d in &drafts {
+            let retained = retain_token_after_eos_decision(
+                d,
+                None,
+                &eos,
+                /* suppress_eos */ true,
+                &mut emitted,
+                &mut logprobs,
+            );
+            if retained == EmitRetention::StoppingEos {
+                finished = true;
+                break;
+            }
+        }
+        assert!(!finished, "suppressed EOS must not end the speculated run");
+        assert_eq!(
+            emitted,
+            vec![10, 11],
+            "suppressed EOS is discarded while later drafts can be retained"
+        );
+    }
+}
+
+#[cfg(test)]
+mod emit_retention_tests {
+    //! Issue #100 v4: unit tests cover the production retention helper that
+    //! `emit_token` and the non-MTP decode path call after bookkeeping. A full
+    //! `ActiveSeq` fixture is not constructible here because `SequenceState`
+    //! owns model-private GPU/SSM state, so this is the narrowest real emit-path
+    //! surface available to unit tests.
+
+    use super::{EmitRetention, retain_token_after_eos_decision};
+
+    fn lp(tok: u32) -> crate::api::TokenLogprobs {
+        crate::api::TokenLogprobs {
+            token_id: tok,
+            logprob: -0.25,
+            top: vec![(tok, -0.25)],
+        }
+    }
+
+    #[test]
+    fn suppressed_eos_discards_token_and_logprobs() {
+        let eos = [151645u32];
+        let mut output_tokens = vec![10];
+        let mut logprobs_data = vec![lp(10)];
+
+        let retained = retain_token_after_eos_decision(
+            151645,
+            Some(lp(151645)),
+            &eos,
+            /* suppress_eos */ true,
+            &mut output_tokens,
+            &mut logprobs_data,
+        );
+
+        assert_eq!(retained, EmitRetention::SuppressedEos);
+        assert_eq!(output_tokens, vec![10]);
+        assert_eq!(logprobs_data.len(), 1);
+        assert_eq!(logprobs_data[0].token_id, 10);
+    }
+
+    #[test]
+    fn stopping_eos_retains_token_and_logprobs() {
+        let eos = [151645u32];
+        let mut output_tokens = vec![10];
+        let mut logprobs_data = vec![lp(10)];
+
+        let retained = retain_token_after_eos_decision(
+            151645,
+            Some(lp(151645)),
+            &eos,
+            /* suppress_eos */ false,
+            &mut output_tokens,
+            &mut logprobs_data,
+        );
+
+        assert_eq!(retained, EmitRetention::StoppingEos);
+        assert_eq!(output_tokens, vec![10, 151645]);
+        assert_eq!(logprobs_data.len(), 2);
+        assert_eq!(logprobs_data[1].token_id, 151645);
+    }
+
+    #[test]
+    fn normal_token_retains_token_and_logprobs() {
+        let eos = [151645u32];
+        let mut output_tokens = Vec::new();
+        let mut logprobs_data = Vec::new();
+
+        let retained = retain_token_after_eos_decision(
+            42,
+            Some(lp(42)),
+            &eos,
+            /* suppress_eos */ false,
+            &mut output_tokens,
+            &mut logprobs_data,
+        );
+
+        assert_eq!(retained, EmitRetention::Retained);
+        assert_eq!(output_tokens, vec![42]);
+        assert_eq!(logprobs_data.len(), 1);
+        assert_eq!(logprobs_data[0].token_id, 42);
     }
 }

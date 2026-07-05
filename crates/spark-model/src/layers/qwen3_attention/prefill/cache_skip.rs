@@ -265,6 +265,10 @@ impl Qwen3AttentionLayer {
         let meta = ctx
             .attn_metadata
             .expect("attention prefill requires metadata");
+        // Sliding split pool: sliding layers write K/V through the ring
+        // twin slots (positions/attention here are contiguous — only the
+        // section-7 cache write consumes meta.slot on this path).
+        let meta = self.meta_for_layer(&meta, kv_cache)?;
         if self.mla.is_some() {
             // MLA: RoPE already applied inside the MLA block to rope portions only.
             // Skip shared RoPE to avoid double-rotation.
@@ -288,6 +292,27 @@ impl Qwen3AttentionLayer {
                 stream,
             )
             .map_err(|e| anyhow::anyhow!("rope_proportional failed: {e}"))?;
+        } else if !self.rope_inv_freq_table.is_null() {
+            // llama3 (NTK-by-parts) RoPE: read frequencies from the
+            // precomputed per-layer table (Step 3.7 full-attention layers).
+            ops::rope_yarn(
+                ctx.gpu,
+                self.rope_yarn_k,
+                q_contiguous,
+                k_contiguous,
+                meta.positions,
+                n,
+                nq,
+                nkv,
+                hd,
+                self.rotary_dim_override
+                    .unwrap_or(ctx.config.rotary_dim() as u32),
+                self.rope_inv_freq_table,
+                self.rope_theta_override
+                    .unwrap_or(ctx.config.rope_theta as f32),
+                stream,
+            )
+            .map_err(|e| anyhow::anyhow!("rope_yarn (llama3) failed: {e}"))?;
         } else {
             ops::rope(
                 ctx.gpu,
@@ -406,209 +431,24 @@ impl Qwen3AttentionLayer {
             );
         }
 
-        // ── 8. Flash Attention on contiguous Q/K/V (BR=64 for long sequences) ──
-        let attn_out = ctx.buffers.attn_output();
-        let inv_sqrt_d = self.effective_attn_scale(hd);
-
-        // TurboQuant WHT bookends (mirrors prefill/paged.rs). For turbo
-        // dtypes, write_kv_cache (section 7) WHT-rotated the written
-        // [kv_write_start..] range of k/v_contiguous IN PLACE before
-        // quantizing it into the cache — so the contiguous buffers this FA
-        // reads already hold WHT(K)/WHT(V) for that range. Bring the rest of
-        // the inputs into the same basis: rotate the unwritten prefix
-        // [0..kv_write_start) (prefix-cache hits skip the write, so the
-        // write-path bookend never touched those rows), rotate Q
-        // (<WHT(Q), WHT(K)> = <Q, K>), and rotate the output back after the
-        // attention (it sits in the rotated-V basis).
-        let (wht_k_dtype, wht_v_dtype) = self.kv_dtype.kv_pair();
-        let k_is_turbo = wht_k_dtype.is_wht_rotated();
-        let v_is_turbo = wht_v_dtype.is_wht_rotated();
-        let weight_pre_rotated = std::env::var("TQ_PLUS_WEIGHT_ROTATION")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let wht_runtime_active = !weight_pre_rotated && (hd == 128 || hd == 256 || hd == 512);
-        if wht_runtime_active && kv_write_start > 0 && self.wht_bf16_k.0 != 0 {
-            use spark_runtime::kernel_args::KernelLaunch;
-            let prefix_heads = kv_write_start as u32 * nkv;
-            if k_is_turbo {
-                KernelLaunch::new(ctx.gpu, self.wht_bf16_k)
-                    .grid([prefix_heads, 1, 1]) // one warp per (token, kv_head)
-                    .block([32, 1, 1])
-                    .arg_ptr(k_contiguous)
-                    .arg_u32(hd)
-                    .launch(stream)?;
-            }
-            if v_is_turbo {
-                KernelLaunch::new(ctx.gpu, self.wht_bf16_k)
-                    .grid([prefix_heads, 1, 1])
-                    .block([32, 1, 1])
-                    .arg_ptr(v_contiguous)
-                    .arg_u32(hd)
-                    .launch(stream)?;
-            }
-        }
-        if k_is_turbo && wht_runtime_active && self.wht_bf16_k.0 != 0 {
-            use spark_runtime::kernel_args::KernelLaunch;
-            KernelLaunch::new(ctx.gpu, self.wht_bf16_k)
-                .grid([n * nq, 1, 1]) // one warp per (token, q_head)
-                .block([32, 1, 1])
-                .arg_ptr(q_contiguous)
-                .arg_u32(hd)
-                .launch(stream)?;
-        }
-        if hd > 256 && self.prefill_attn_512_k.0 != 0 {
-            // HDIM=512: use scalar reference kernel (BR=16, correct for any head_dim)
-            // Full-attention layers (this path) always pass sliding_window=0.
-            ops::prefill_attention(
-                ctx.gpu,
-                self.prefill_attn_512_k,
-                q_contiguous,
-                k_contiguous,
-                v_contiguous,
-                attn_out,
-                n,
-                1,
-                nq,
-                nkv,
-                hd,
-                inv_sqrt_d,
-                true,
-                0,
-                stream,
-            )
-            .map_err(|e| {
-                anyhow::anyhow!("prefill_512 failed: n={n} nq={nq} nkv={nkv} hd={hd}: {e}")
-            })?;
-        } else {
-            ops::prefill_attention_64(
-                ctx.gpu,
-                self.prefill_attn_64_k,
-                q_contiguous,
-                k_contiguous,
-                v_contiguous,
-                attn_out,
-                n,
-                1,
-                nq,
-                nkv,
-                hd,
-                inv_sqrt_d,
-                true,
-                self.sliding_window.unwrap_or(0),
-                stream,
-            )
-            .map_err(|e| {
-                anyhow::anyhow!("flash_attn_64 failed: n={n} nq={nq} nkv={nkv} hd={hd}: {e}")
-            })?;
-        }
-
-        // TurboQuant WHT bookend (output side): attention output is
-        // sum(softmax * WHT(V)) — rotate back to the real basis.
-        if v_is_turbo && wht_runtime_active && self.wht_bf16_k_inv.0 != 0 {
-            use spark_runtime::kernel_args::KernelLaunch;
-            KernelLaunch::new(ctx.gpu, self.wht_bf16_k_inv)
-                .grid([n * nq, 1, 1])
-                .block([32, 1, 1])
-                .arg_ptr(attn_out)
-                .arg_u32(hd)
-                .launch(stream)?;
-        }
-        aprof!("flash_attn_64", t0);
-        t0 = if ctx.profile {
-            ctx.gpu.synchronize(stream)?;
-            Some(std::time::Instant::now())
-        } else {
-            None
+        let args = super::cache_skip_flash::CacheSkipFlashArgs {
+            normed,
+            qg_out,
+            q_contiguous,
+            k_contiguous,
+            v_contiguous,
+            num_tokens,
+            kv_write_start,
+            n,
+            h,
+            nq,
+            nkv,
+            hd,
+            q_dim,
+            q_proj_dim,
+            bf16,
+            stream,
         };
-
-        // ATLAS_OP_DUMP: attn_out BEFORE sigmoid gate (raw FlashAttention output).
-        // Compares 1:1 against vLLM's "attn_out" dump in qwen3_next.py.
-        if num_tokens > 0 {
-            let nq_hd = (nq * hd) as usize;
-            super::super::op_dump::dump_bf16(
-                ctx.gpu,
-                attn_out,
-                (num_tokens - 1) * nq_hd * bf16,
-                nq_hd,
-                self.attn_layer_idx,
-                "attn_out_pre_gate",
-                stream,
-            )?;
-        }
-
-        // ── 9. Sigmoid gate × attn_out (gated only) — single batched kernel ──
-        if self.gated {
-            let gate_base = qg_out.offset(q_dim * bf16);
-            ops::sigmoid_gate_mul_batched(
-                ctx.gpu,
-                self.sigmoid_gate_mul_batched_k,
-                attn_out,
-                gate_base,
-                attn_out,
-                nq * hd,
-                q_proj_dim as u32,
-                n,
-                stream,
-            )?;
-        }
-
-        // ── 9b. Per-head attention gate (Step 3.7 g_proj) ──
-        // g_proj produces one scalar per head from the normed hidden states.
-        // Applied as: attn_out = attn_out * sigmoid(gate).broadcast_over(hd)
-        if let Some(ref g_proj) = self.head_gate_weight {
-            // Reuse q_contiguous as scratch for gate output [n, nq] BF16.
-            // Q buffer is no longer needed after flash attention.
-            let gate_buf = q_contiguous;
-            // GEMM: normed [n, H] × g_proj^T [H, nq] → gate_buf [n, nq]
-            ops::dense_gemm_tc(
-                ctx.gpu,
-                self.dense_gemm_tc_k,
-                normed,
-                g_proj,
-                gate_buf,
-                n,
-                nq,
-                h,
-                stream,
-            )?;
-            // Sigmoid + broadcast multiply: attn_out[t,h,d] *= sigmoid(gate[t,h])
-            ops::sigmoid_gate_mul_head_broadcast(
-                ctx.gpu,
-                self.sigmoid_gate_head_broadcast_k,
-                attn_out,
-                gate_buf,
-                attn_out,
-                nq,
-                hd,
-                n,
-                stream,
-            )?;
-        }
-        aprof!("sigmoid_gate", t0);
-        t0 = if ctx.profile {
-            ctx.gpu.synchronize(stream)?;
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
-        // ATLAS_OP_DUMP: attn_out AFTER sigmoid gate (input to o_proj linear).
-        if num_tokens > 0 {
-            let nq_hd = (nq * hd) as usize;
-            super::super::op_dump::dump_bf16(
-                ctx.gpu,
-                attn_out,
-                (num_tokens - 1) * nq_hd * bf16,
-                nq_hd,
-                self.attn_layer_idx,
-                "attn_out_post_gate",
-                stream,
-            )?;
-        }
-
-        // ── 10. O projection GEMM ── (extracted to paged_oproj.rs)
-        let o_out = self.prefill_attention_paged_oproj(attn_out, n, h, nq, hd, ctx, stream)?;
-        aprof!("o_proj", t0);
-        Ok(o_out)
+        self.prefill_attention_cache_skip_flash(ctx, &args, t0)
     }
 }

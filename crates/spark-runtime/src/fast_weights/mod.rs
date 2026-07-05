@@ -18,7 +18,7 @@
 
 use crate::gpu::GpuBackend;
 use crate::weights::{
-    WeightLoader, WeightStore, WeightTensor, check_oom_guard, estimate_has_fp8,
+    EpShard, WeightLoader, WeightStore, WeightTensor, check_oom_guard, estimate_has_fp8,
     estimate_load_bytes, evict_page_cache, parse_expert_index,
 };
 use anyhow::{Context, Result, bail};
@@ -118,6 +118,7 @@ impl WeightLoader for FastSafetensorsLoader {
         oom_reserve_bytes: usize,
     ) -> Result<WeightStore> {
         let skip_fn = |name: &str| self.should_skip_tensor(name);
+        let ep = EpShard::from_parts(self.ep_rank, self.ep_world_size, self.num_experts);
 
         // Resolve shard list (sharded index, single file, or unindexed shards).
         let (shard_files, tensor_to_shard): (Vec<PathBuf>, Option<HashMap<String, String>>) =
@@ -125,8 +126,8 @@ impl WeightLoader for FastSafetensorsLoader {
 
         // Pre-flight OOM estimate (identical to SafetensorsLoader).
         {
-            let estimated = estimate_load_bytes(&shard_files, &skip_fn)?;
-            let has_fp8 = estimate_has_fp8(&shard_files, &skip_fn)?;
+            let estimated = estimate_load_bytes(&shard_files, &skip_fn, ep)?;
+            let has_fp8 = estimate_has_fp8(&shard_files, &skip_fn, ep)?;
             let mult = self
                 .peak_memory_multiplier
                 .unwrap_or(if has_fp8 { 1.5 } else { 1.3 });
@@ -192,6 +193,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 &skip_fn,
                 self.try_direct_io,
                 self.direct_io_tensor_cap,
+                ep,
                 &mut weights,
                 &mut offload_logged,
             )?;
@@ -227,6 +229,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 &no_skip,
                 self.try_direct_io,
                 self.direct_io_tensor_cap,
+                EpShard::inactive(),
                 &mut weights,
                 &mut extra_offload,
             )?;
@@ -254,6 +257,7 @@ fn load_shard_fast(
     skip_fn: &dyn Fn(&str) -> bool,
     try_direct_io: bool,
     direct_io_tensor_cap: usize,
+    ep: EpShard,
     out: &mut HashMap<String, WeightTensor>,
     offload_logged: &mut bool,
 ) -> Result<()> {
@@ -270,6 +274,15 @@ fn load_shard_fast(
         tensors.retain(|t| allow_set.contains(t.name.as_str()));
     }
     tensors.retain(|t| !skip_fn(&t.name));
+    for tensor in &mut tensors {
+        if let Some((off, len, local_shape)) =
+            ep.fused_slice(&tensor.name, &tensor.shape, tensor.len)
+        {
+            tensor.abs_offset += off as u64;
+            tensor.len = len;
+            tensor.shape = local_shape;
+        }
+    }
 
     // Per-shard heuristic: above `direct_io_tensor_cap` tensors, O_DIRECT's
     // per-tensor syscall + 4 KiB alignment overhead costs more than kernel

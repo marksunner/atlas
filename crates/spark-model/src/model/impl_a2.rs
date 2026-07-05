@@ -71,6 +71,12 @@ impl TransformerModel {
                 seq_len: self.gpu.alloc(std::mem::size_of::<u32>())?,
                 block_capacity: required_blocks,
                 uploaded_blocks: 0,
+                sliding_block_table: if self.sliding_ring_len() > 0 {
+                    self.gpu.alloc(required_blocks.max(1) * 4)?
+                } else {
+                    DevicePtr::NULL
+                },
+                uploaded_sliding_blocks: 0,
             });
         }
 
@@ -92,6 +98,9 @@ impl TransformerModel {
             }
             if !meta.seq_len.is_null() {
                 self.gpu.free(meta.seq_len)?;
+            }
+            if !meta.sliding_block_table.is_null() {
+                self.gpu.free(meta.sliding_block_table)?;
             }
         }
         Ok(())

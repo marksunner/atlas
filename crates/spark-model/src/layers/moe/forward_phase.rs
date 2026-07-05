@@ -69,6 +69,8 @@ impl MoeLayer {
             top_k,
             stream,
         )?;
+        self.clamp_routed_gate_up(ctx.gpu, expert_gate_out, expert_up_out, top_k * inter, stream)?;
+        self.clamp_shared_gate_up(ctx.gpu, shared_gate_scratch, shared_up_scratch, inter, stream)?;
         ops::moe_expert_silu_down_shared_t(
             ctx.gpu,
             self.moe_expert_silu_down_shared_t_k,

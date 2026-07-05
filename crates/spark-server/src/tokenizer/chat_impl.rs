@@ -54,6 +54,18 @@ impl ChatTokenizer {
                 super::jinja_helpers::build_jinja_env(&tmpl).ok()
             });
 
+        // Load bos_token / eos_token display strings for the Jinja context.
+        // Templates such as Step 3.7 Flash reference `{{ bos_token }}`; without
+        // supplying it the variable renders empty and BOS (the attention-sink
+        // token) is silently dropped, causing greedy decode to copy-loop.
+        let bos_token =
+            super::jinja_helpers::load_special_token(model_dir, "bos_token").unwrap_or_default();
+        let eos_token =
+            super::jinja_helpers::load_special_token(model_dir, "eos_token").unwrap_or_default();
+        tracing::info!(
+            "Loaded special tokens for Jinja context: bos_token={bos_token:?} eos_token={eos_token:?}"
+        );
+
         tracing::info!("Loaded tokenizer from {}", tokenizer_path.display());
         Ok(Self {
             tokenizer,
@@ -62,6 +74,8 @@ impl ChatTokenizer {
             chat_template,
             jinja_env,
             openai_jinja_env,
+            bos_token,
+            eos_token,
         })
     }
 
@@ -154,6 +168,8 @@ impl ChatTokenizer {
             reasoning_effort => reasoning_effort,
             disable_tool_steering => disable_tool_steering,
             add_vision_id => false,
+            bos_token => self.bos_token,
+            eos_token => self.eos_token,
         };
 
         let rendered = tmpl.render(ctx).map_err(|e| {
@@ -208,6 +224,8 @@ impl ChatTokenizer {
                 reasoning_effort => reasoning_effort,
                 disable_tool_steering => disable_tool_steering,
                 add_vision_id => false,
+                bos_token => self.bos_token,
+                eos_token => self.eos_token,
             };
             let rendered = tmpl
                 .render(ctx)

@@ -28,6 +28,7 @@ impl ModelConfig {
             shared_expert_intermediate_size: 512,
             norm_topk_prob: true,
             decoder_sparse_step: 1,
+            num_dense_ffn_layers: 0,
             layer_types: {
                 let mut types = Vec::with_capacity(48);
                 for i in 0..48 {
@@ -43,6 +44,15 @@ impl ModelConfig {
             sliding_window: 0,
             max_position_embeddings: 262144,
             rope_theta: 10_000_000.0,
+            rope_theta_per_layer: Vec::new(),
+            partial_rotary_factors: Vec::new(),
+            swiglu_limits: Vec::new(),
+            swiglu_limits_shared: Vec::new(),
+            rope_llama3_factor: 0.0,
+            rope_llama3_low_freq_factor: 1.0,
+            rope_llama3_high_freq_factor: 4.0,
+            rope_llama3_original_max_position: 8192,
+            rope_llama3_full_attention_only: false,
             rms_norm_eps: 1e-6,
             bos_token_id: 151643,
             eos_token_id: 151645,

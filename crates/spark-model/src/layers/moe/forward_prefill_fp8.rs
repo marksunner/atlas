@@ -98,6 +98,9 @@ impl MoeLayer {
             ctx.gpu.synchronize(stream)?;
             ctx.gpu.free(input_fp8)?;
             ctx.gpu.free(input_scale)?;
+            // Step 3.7 swiglu_limits_shared: clamp shared gate/up before
+            // activation (no-op on layers without limits).
+            self.clamp_shared_gate_up(ctx.gpu, shared_gate_out, shared_up_out, n * shared_inter, stream)?;
             ops::silu_mul(
                 ctx.gpu,
                 self.moe_act_mul,
@@ -177,6 +180,9 @@ impl MoeLayer {
                 shared_inter,
                 h,
             )?;
+            // Step 3.7 swiglu_limits_shared: clamp shared gate/up before
+            // activation (no-op on layers without limits).
+            self.clamp_shared_gate_up(ctx.gpu, shared_gate_out, shared_up_out, n * shared_inter, stream)?;
             // Activation + down for shared expert (SiLU or GeGLU)
             ops::silu_mul(
                 ctx.gpu,
@@ -466,6 +472,15 @@ impl MoeLayer {
         // 6. Activation+mul + down GEMM
         let expert_down_out = ctx.buffers.expert_down_out();
         if force_w8a8 && max_m_tiles > 0 {
+            // Step 3.7 swiglu_limits: clamp routed gate/up before activation
+            // (no-op on layers without limits).
+            self.clamp_routed_gate_up(
+                ctx.gpu,
+                expert_gate_out,
+                expert_up_out,
+                total_expanded * inter,
+                stream,
+            )?;
             ops::silu_mul(
                 ctx.gpu,
                 self.moe_act_mul,
@@ -512,6 +527,15 @@ impl MoeLayer {
             ctx.gpu.free(down_in_fp8)?;
             ctx.gpu.free(down_in_scale)?;
         } else if max_m_tiles > 0 {
+            // Step 3.7 swiglu_limits: clamp routed gate/up before activation
+            // (no-op on layers without limits).
+            self.clamp_routed_gate_up(
+                ctx.gpu,
+                expert_gate_out,
+                expert_up_out,
+                total_expanded * inter,
+                stream,
+            )?;
             ops::silu_mul(
                 ctx.gpu,
                 self.moe_act_mul,

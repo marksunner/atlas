@@ -202,6 +202,7 @@ pub async fn completions(
         thinking_budget: None,
         repetition_detection: req.repetition_detection,
         require_tool_call: false,
+        tools_active: false,
         suppress_tool_call: false,
         disable_mtp: false,
         grammar_spec: None,
@@ -250,8 +251,17 @@ pub async fn completions(
             );
         }
     };
-    let output_text = strip_stop_sequences(output_text, &req.stop);
+    // #100 Finding 3: strip hidden reasoning FIRST, then apply user stop
+    // sequences. `strip_stop_sequences` now truncates at the FIRST occurrence of
+    // a stop string anywhere in the text (not just the trailing suffix). If a
+    // user stop string also appears inside `<think>...</think>` reasoning,
+    // applying stops before removing the reasoning would truncate the output at
+    // the hidden-reasoning match and drop the real answer. `strip_thinking_tags`
+    // returns only the post-`</think>` response, so stops then match against the
+    // visible answer only — matching the chat path, which strips stops after
+    // `decode_response_text` has already removed thinking.
     let output_text = strip_thinking_tags(&output_text);
+    let output_text = strip_stop_sequences(output_text, &req.stop);
 
     let num_completion = response.output_tokens.len();
     let tokens_per_second = if response.decode_time_ms > 0.0 {
@@ -334,6 +344,7 @@ pub(super) async fn completions_stream(
         thinking_budget: None,
         repetition_detection,
         require_tool_call: false,
+        tools_active: false,
         suppress_tool_call: false,
         disable_mtp: false,
         grammar_spec: None,

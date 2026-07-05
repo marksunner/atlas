@@ -67,10 +67,91 @@ temperature = 0.7
 top_p = 0.95
 top_k = 20
 
+# 2026-07-04 (Fable-5 iteration 2): DRY penalty for the two NON-tool
+# presets. After the swiglu_limits clamp fix (real conformance bug,
+# layers 43/44), temp-0.9 open-ended stories STILL enter verbatim
+# sentence attractors ~40% of runs ('he had written'×44,
+# 'about a clockwork'×22) that burn to max_tokens; the n-gram watchdog
+# bounds the damage but the emitted text is already streamed. DRY
+# (llama.cpp PR#9702 port, exponential penalty on extending a repeated
+# ≥3-token sequence) targets exactly this attractor class at the
+# sampler; llama.cpp — one of the three engines this model is reported
+# clean on — ships repeat mitigation by default. NOT applied to the
+# tools preset: structural tool-call tokens repeat legitimately, and the
+# R13/R14 tie-break history shows tool decoding is sensitive to logit
+# perturbation.
+[sampling.thinking_text]
+temperature = 0.7
+top_p = 0.95
+top_k = 20
+dry_multiplier = 0.5
+
+[sampling.non_thinking]
+temperature = 0.7
+top_p = 0.95
+top_k = 20
+dry_multiplier = 0.5
+
 [behavior]
 thinking_default = true
-thinking_in_tools = false
+# 2026-07-03 (STEP37-QUALITY Round 8): MUST stay true. Step-3.7-Flash is a
+# reasoning model that RELIES on its <think> phase to stay coherent at long
+# context. With thinking_in_tools=false, a Hermes agent request (38 tool defs +
+# grammar-constrained decoding) at ~27K context collapsed into verbatim
+# repetition loops — the model echoed the user query / system-prompt fragments
+# ~100× and burned the whole token budget (finish=length). The controlled repro
+# (forge-output/STEP37-QUALITY/tooltest.py, identical 27K prompt + 38 tools,
+# toggling ONLY thinking) is decisive: think-OFF → rep=1.000, 9 strong loops;
+# think-ON → clean 1-sentence answer AND a valid grammar-constrained tool_call
+# (rep=0.000). This is NOT a grammar/tool bug — grammar+tools work fine once the
+# model is allowed to reason first. Every other thinking model (qwen3.x, gemma4,
+# nemotron, minimax, mistral) already sets thinking_in_tools=true; step3p7 was
+# the lone outlier, left =false in the #136 support commit and never revisited.
+thinking_in_tools = true
 max_thinking_budget = 2048
+# 2026-07-03 (STEP37-QUALITY Round 9): disable server-side XGrammar structural-tag
+# enforcement on tool_choice="auto"/tools-present requests. Root cause of the
+# real-Hermes 27K loop: Atlas builds the tool-call grammar whenever tools are
+# present (api/chat/sampling_setup.rs `else if tools_active`), and in grammar
+# mode the legacy "stop after the first </tool_call>" (decode_logits_step.rs,
+# gated on grammar_state.is_none()) never fires — so after ONE valid tool call
+# the structural-tag grammar (use_triggers=true, at_least_one=false) lets greedy
+# decode re-open <tool_call> and loop. HW-captured logprobs (real Hermes prompt,
+# temp 0, bit-identical across two runs → deterministic, NOT the sliding-KV
+# race) show the exact attractor: at the </tool_call> boundary the model prefers
+# repeating <tool_call> (lp -0.53) over EOS (lp -1.22, UNMASKED), then the second
+# malformed tool call collapses into a period-4 `</first-line>\n` loop — exactly
+# the brief's "period-4…20 repeat" + "hallucinates tool calls". With the grammar
+# OFF the request falls to legacy mode, which HARD-STOPS after the first
+# </tool_call>: one clean tool call, no loop. Tool calls are still parsed
+# post-hoc by the tool_call_parser (verified: unconstrained output at 24K
+# coherent context yields a valid read_file call). This closes the Atlas-vs-vLLM
+# divergence the brief asked to find — per the --disable-tool-grammar CLI help:
+# "Matches vLLM's default behaviour in auto mode (vLLM only grammar-constrains
+# when tool_choice='required')". Step-3.7 tool-calls reliably unconstrained
+# (structure-snowballing escape hatch, arXiv:2604.06066).
+disable_tool_grammar = true
+# 2026-07-04 (STEP37-QUALITY Round 11): bound the temp-0 content-phase
+# over-generation. After the BOS fix (Round 10) the reasoning/content parser
+# routes correctly, but on CONSTRAINT-following prompts ("in exactly N
+# sentences", "write exactly 600 words") the model self-audits in the content
+# phase ("It is also exactly four sentences, as requested…") and greedy decode
+# turns that self-review into a period-N loop that otherwise burns to
+# max_tokens (observed: "like the Atlantic, like the Atlantic…" ×30,
+# "```sentence count: 4 sentences```" ×5, finish=length, 2.6-3.4 KB of loop).
+# This is fundamental temp-0 model behavior — NOT a routing bug — and is not
+# curable by sampling (persists at temp 0.7 + top_p 0.95 + top_k 20 +
+# frequency_penalty 0.4 across samples) or by a larger thinking budget (the
+# model closes </think> naturally, well under budget). enable_loop_watchdog is
+# a BACKSTOP: it does not make constraint-following pristine, it caps the
+# damage — the period-N content loop is cut early instead of running to the
+# token cap. Every other Atlas model that loops in content sets this; step3p7
+# was left at the false default. NOTE: MODEL.toml is compile-time baked — this
+# takes effect only after a supervised rebuild + redeploy (not yet validated
+# on hardware as of Round 11; the live server is left running with the Round 10
+# BOS fix). Non-constraint factual, tool-call, and long-context retrieval all
+# terminate cleanly at temp 0 already and are unaffected by this backstop.
+enable_loop_watchdog = true
 
 [[model_types]]
 model_type = "step3p7"

@@ -76,6 +76,13 @@ pub struct ChatTokenizer {
     /// OpenAI-variant template: gates historical `<think>` wrappers on enable_thinking.
     /// Falls back to jinja_env if no openai/ variant exists.
     openai_jinja_env: Option<minijinja::Environment<'static>>,
+    /// BOS token string supplied to the Jinja context as `{{ bos_token }}`.
+    /// Empty when the model defines no BOS. DeepSeek-lineage templates (Step 3.7)
+    /// rely on this to place the BOS attention-sink token.
+    bos_token: String,
+    /// EOS token string supplied to the Jinja context as `{{ eos_token }}`.
+    /// Empty when the model defines no EOS.
+    eos_token: String,
 }
 
 /// Wrapper around tokenizers::DecodeStream that hides the generic parameters.
@@ -137,6 +144,109 @@ mod tests {
             add_vision_id => false,
         };
         tmpl.render(ctx).expect("template renders")
+    }
+
+    /// The Jinja BOS fix (Round 11B): `load_special_token` must resolve
+    /// `bos_token` from either the bare-string form (special_tokens_map.json)
+    /// or the AddedToken object form (`{"content": "..."}`), preferring
+    /// special_tokens_map.json over tokenizer_config.json. Without a resolved
+    /// value, `{{ bos_token }}` renders empty and DeepSeek-lineage models
+    /// (Step 3.7) lose their BOS attention-sink token.
+    #[test]
+    fn load_special_token_reads_both_json_forms() {
+        use std::io::Write;
+
+        // Bare-string form in special_tokens_map.json.
+        let dir_str = std::env::temp_dir().join("atlas_bos_test_str");
+        std::fs::create_dir_all(&dir_str).unwrap();
+        let mut f = std::fs::File::create(dir_str.join("special_tokens_map.json")).unwrap();
+        f.write_all(
+            r#"{"bos_token": "<｜begin▁of▁sentence｜>", "eos_token": "<｜end▁of▁sentence｜>"}"#
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            super::jinja_helpers::load_special_token(&dir_str, "bos_token").as_deref(),
+            Some("<｜begin▁of▁sentence｜>")
+        );
+        assert_eq!(
+            super::jinja_helpers::load_special_token(&dir_str, "eos_token").as_deref(),
+            Some("<｜end▁of▁sentence｜>")
+        );
+        std::fs::remove_dir_all(&dir_str).ok();
+
+        // AddedToken object form, only present in tokenizer_config.json.
+        let dir_obj = std::env::temp_dir().join("atlas_bos_test_obj");
+        std::fs::create_dir_all(&dir_obj).unwrap();
+        let mut f = std::fs::File::create(dir_obj.join("tokenizer_config.json")).unwrap();
+        f.write_all(
+            br#"{"bos_token": {"content": "<bos>", "lstrip": false, "normalized": false}}"#
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            super::jinja_helpers::load_special_token(&dir_obj, "bos_token").as_deref(),
+            Some("<bos>")
+        );
+        // Missing key → None (model defines no such special token).
+        assert_eq!(
+            super::jinja_helpers::load_special_token(&dir_obj, "pad_token"),
+            None
+        );
+        std::fs::remove_dir_all(&dir_obj).ok();
+
+        // Absent directory / files → None, never panics.
+        let dir_missing = std::env::temp_dir().join("atlas_bos_test_absent_dir");
+        std::fs::remove_dir_all(&dir_missing).ok();
+        assert_eq!(
+            super::jinja_helpers::load_special_token(&dir_missing, "bos_token"),
+            None
+        );
+    }
+
+    /// End-to-end proof for Round 11B: a chat template referencing
+    /// `{{ bos_token }}` must actually emit the BOS string through the
+    /// production `apply_chat_template_jinja` path. Before the fix the
+    /// variable was never in the context, so it rendered empty and BOS
+    /// (the DeepSeek/Step attention-sink) silently vanished. Uses the real
+    /// Qwen tokenizer on disk for the encode; skips cleanly if absent.
+    #[test]
+    fn apply_chat_template_jinja_emits_bos_token() {
+        let Some(home) = std::env::var_os("HOME") else {
+            eprintln!("HOME not set; skipping bos integration test");
+            return;
+        };
+        let model_dir = std::path::Path::new(&home).join("models/Qwen3.5-397B-A17B-NVFP4");
+        if !model_dir.join("tokenizer.json").exists() {
+            eprintln!("Qwen tokenizer not on disk; skipping bos integration test");
+            return;
+        }
+        let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
+        // Minimal template that places BOS then the user turn — mirrors the
+        // DeepSeek/Step 3.7 shape that regressed without the context var.
+        let template = "{{ bos_token }}{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}";
+        let jinja_env = super::jinja_helpers::build_jinja_env(template).unwrap();
+        let tok = ChatTokenizer {
+            tokenizer,
+            eos_token_id: 0,
+            supports_thinking: false,
+            chat_template: template.to_string(),
+            jinja_env,
+            openai_jinja_env: None,
+            bos_token: "<｜begin▁of▁sentence｜>".to_string(),
+            eos_token: "<｜end▁of▁sentence｜>".to_string(),
+        };
+        let messages = vec![json!({"role": "user", "content": "hi"})];
+        let ids = tok
+            .apply_chat_template_jinja(&messages, None, false, false)
+            .unwrap();
+        // Decode back (with specials) and confirm the BOS literal survived
+        // into the rendered+encoded prompt.
+        let decoded = tok.decode_with_special(&ids).unwrap();
+        assert!(
+            decoded.contains("<｜begin▁of▁sentence｜>"),
+            "BOS token missing from rendered prompt: {decoded:?}"
+        );
     }
 
     #[test]
